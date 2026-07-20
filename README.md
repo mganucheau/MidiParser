@@ -25,12 +25,13 @@ midi-organize
 python -m midi_parser
 ```
 
-1. Browse to a **source** folder containing MIDI files
-2. Browse to a **destination** folder
+1. **Add** one or more **source** folders (multi-select via Add)
+2. Browse to a **destination** folder (existing libraries are reused — only missing category folders are created)
 3. Click **Scan** to preview classifications and counts
-4. Click **Organize** to copy files into category subfolders
+4. Choose **Copy** or **Move**, then **Organize**
 
 Options:
 
-- **Dry run** — preview without copying
-- **Remove duplicates** — skip files with identical content (SHA-256); first occurrence is kept
+- **Copy / Move** — leave sources in place, or relocate them into the destination
+- **Dry run** — preview without copying or moving
+- **Remove duplicates** — skip identical content (SHA-256), including files already in the destination from a prior session

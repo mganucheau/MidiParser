@@ -1,19 +1,21 @@
-"""Classify MIDI files and copy them into category folders."""
+"""Classify MIDI files and copy/move them into category folders."""
 
 from __future__ import annotations
 
 import hashlib
 import shutil
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 from midi_parser import CATEGORIES
 from midi_parser.assess import assess_file
 from midi_parser.name_hints import category_from_name
-from midi_parser.scan import find_midi_files
+from midi_parser.scan import find_midi_files_with_roots
 
 ProgressCallback = Callable[[int, int, str], None]
+TransferMode = Literal["copy", "move"]
 
 
 @dataclass
@@ -38,12 +40,21 @@ def file_content_hash(path: Path | str) -> str:
     return h.hexdigest()
 
 
-def classify_file(path: Path, source_root: Path) -> FileResult:
+def classify_file(
+    path: Path,
+    *,
+    relative: str | None = None,
+    source_root: Path | None = None,
+) -> FileResult:
     """Classify one MIDI file using name hints then content assessment."""
-    try:
-        relative = str(path.relative_to(source_root))
-    except ValueError:
-        relative = path.name
+    if relative is None:
+        if source_root is not None:
+            try:
+                relative = str(path.relative_to(source_root))
+            except ValueError:
+                relative = path.name
+        else:
+            relative = path.name
 
     try:
         digest = file_content_hash(path)
@@ -73,16 +84,19 @@ def classify_file(path: Path, source_root: Path) -> FileResult:
     )
 
 
-def mark_duplicates(results: list[FileResult]) -> list[FileResult]:
+def mark_duplicates(
+    results: list[FileResult],
+    *,
+    existing_hashes: dict[str, str] | None = None,
+) -> list[FileResult]:
     """
     Mark later files with the same content hash as duplicates of the first.
 
-    First occurrence (scan order) is kept. Duplicates keep their category for
-    display but set is_duplicate / reason='duplicate'.
+    ``existing_hashes`` maps content hash → label for files already in the
+    destination (so a new session won't re-add the same content).
     """
-    seen: dict[str, str] = {}  # hash → relative of keeper
+    seen: dict[str, str] = dict(existing_hashes or {})
     for result in results:
-        # Reset prior marks so re-running is idempotent
         if result.reason == "duplicate":
             result.reason = "content"
         result.is_duplicate = False
@@ -101,20 +115,19 @@ def mark_duplicates(results: list[FileResult]) -> list[FileResult]:
 
 
 def classify_all(
-    source: Path | str,
+    sources: Path | str | list[Path | str],
     progress: ProgressCallback | None = None,
     *,
     remove_duplicates: bool = False,
 ) -> list[FileResult]:
-    """Scan source and classify every MIDI file."""
-    root = Path(source).expanduser().resolve()
-    files = find_midi_files(root)
+    """Scan one or more source roots and classify every MIDI file."""
+    entries = find_midi_files_with_roots(sources)
     results: list[FileResult] = []
-    total = len(files)
-    for i, path in enumerate(files, start=1):
+    total = len(entries)
+    for i, (path, _root, relative) in enumerate(entries, start=1):
         if progress:
             progress(i, total, path.name)
-        results.append(classify_file(path, root))
+        results.append(classify_file(path, relative=relative))
     if remove_duplicates:
         mark_duplicates(results)
     return results
@@ -153,51 +166,101 @@ def _unique_dest(folder: Path, filename: str) -> Path:
         n += 1
 
 
+def _ensure_category_dirs(dest_root: Path, categories: Iterable[str]) -> None:
+    """Create only missing category folders; never wipe existing ones."""
+    for category in categories:
+        folder = dest_root / category
+        if not folder.exists():
+            folder.mkdir(parents=True, exist_ok=True)
+
+
+def existing_dest_hashes(dest_root: Path) -> dict[str, str]:
+    """
+    Hash MIDI files already in dest category folders.
+
+    Used so Remove duplicates skips content already present from a prior session.
+    """
+    hashes: dict[str, str] = {}
+    root = Path(dest_root)
+    if not root.is_dir():
+        return hashes
+    for category in CATEGORIES:
+        folder = root / category
+        if not folder.is_dir():
+            continue
+        for path in folder.rglob("*"):
+            if not path.is_file() or path.suffix.lower() not in {".mid", ".midi"}:
+                continue
+            try:
+                digest = file_content_hash(path)
+            except OSError:
+                continue
+            if digest not in hashes:
+                rel = f"{category}/{path.name}"
+                hashes[digest] = rel
+    return hashes
+
+
+def _clear_duplicate_marks(results: list[FileResult]) -> None:
+    for result in results:
+        if not (result.is_duplicate or result.reason == "duplicate"):
+            continue
+        result.is_duplicate = False
+        result.duplicate_of = None
+        hint = category_from_name(result.filename)
+        if hint is not None:
+            result.reason = "name"
+        elif result.category == "Unknown":
+            result.reason = "unknown"
+        else:
+            result.reason = "content"
+
+
+def _transfer(src: Path, dest: Path, mode: TransferMode) -> None:
+    if mode == "move":
+        shutil.move(str(src), str(dest))
+    else:
+        shutil.copy2(src, dest)
+
+
 def organize(
-    source: Path | str,
+    sources: Path | str | list[Path | str],
     dest: Path | str,
     *,
     dry_run: bool = False,
     remove_duplicates: bool = False,
+    mode: TransferMode = "copy",
     results: list[FileResult] | None = None,
     progress: ProgressCallback | None = None,
 ) -> tuple[list[FileResult], dict[str, int]]:
     """
-    Classify (if needed) and copy files into dest/<Category>/.
+    Classify (if needed) and copy/move files into dest/<Category>/.
 
-    When remove_duplicates is True, only the first file with a given content
-    hash is copied; later duplicates are skipped.
+    Existing destination category folders are reused (only missing ones are
+    created). Never deletes destination contents.
 
-    Returns (results with dest filled, counts of copied/kept files).
+    When remove_duplicates is True, skips content already in the destination
+    and later source duplicates with the same hash.
     """
-    source_root = Path(source).expanduser().resolve()
     dest_root = Path(dest).expanduser().resolve()
 
     if results is None:
         results = classify_all(
-            source_root,
+            sources,
             progress=progress,
-            remove_duplicates=remove_duplicates,
+            remove_duplicates=False,
         )
-    elif remove_duplicates:
-        mark_duplicates(results)
-    else:
-        for result in results:
-            if not (result.is_duplicate or result.reason == "duplicate"):
-                continue
-            result.is_duplicate = False
-            result.duplicate_of = None
-            hint = category_from_name(result.filename)
-            if hint is not None:
-                result.reason = "name"
-            elif result.category == "Unknown":
-                result.reason = "unknown"
-            else:
-                result.reason = "content"
 
+    existing = existing_dest_hashes(dest_root) if remove_duplicates else {}
+    if remove_duplicates:
+        mark_duplicates(results, existing_hashes=existing)
+    else:
+        _clear_duplicate_marks(results)
+
+    needed = {r.category for r in results if not (remove_duplicates and r.is_duplicate)}
     if not dry_run:
-        for category in CATEGORIES:
-            (dest_root / category).mkdir(parents=True, exist_ok=True)
+        dest_root.mkdir(parents=True, exist_ok=True)
+        _ensure_category_dirs(dest_root, needed)
 
     total = len(results)
     for i, result in enumerate(results, start=1):
@@ -209,9 +272,19 @@ def organize(
             continue
 
         folder = dest_root / result.category
+        if dry_run and not folder.exists():
+            # Preview path without creating folders
+            target = folder / result.filename
+            if target.exists():
+                target = _unique_dest(folder, result.filename)
+            result.dest = target
+            continue
+
+        if not dry_run:
+            folder.mkdir(parents=True, exist_ok=True)
         target = _unique_dest(folder, result.filename)
         result.dest = target
         if not dry_run:
-            shutil.copy2(result.source, target)
+            _transfer(result.source, target, mode)
 
     return results, count_by_category(results, exclude_duplicates=remove_duplicates)

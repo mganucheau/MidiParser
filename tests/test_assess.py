@@ -80,7 +80,7 @@ def test_name_hint_beats_content(tmp_path: Path):
     # Content would be bass pitches, but name says Lead
     path = tmp_path / "LD_line.mid"
     _write_simple_midi(path, [36, 38, 40])
-    result = classify_file(path, tmp_path)
+    result = classify_file(path, source_root=tmp_path)
     assert result.category == "Lead"
     assert result.reason == "name"
 
@@ -164,3 +164,75 @@ def test_without_remove_duplicates_copies_all(tmp_path: Path):
     assert sum(counts.values()) == 2
     assert len(list(dst.rglob("*.mid"))) == 2
     assert all(not r.is_duplicate for r in results)
+
+
+def test_multi_source_scan(tmp_path: Path):
+    from midi_parser.organize import classify_all
+    from midi_parser.scan import find_midi_files_with_roots
+
+    a = tmp_path / "lib_a"
+    b = tmp_path / "lib_b"
+    a.mkdir()
+    b.mkdir()
+    _write_simple_midi(a / "BA_one.mid", [36])
+    _write_simple_midi(b / "LD_two.mid", [60])
+
+    found = find_midi_files_with_roots([a, b])
+    assert len(found) == 2
+    displays = {rel for _p, _r, rel in found}
+    assert "lib_a/BA_one.mid" in displays
+    assert "lib_b/LD_two.mid" in displays
+
+    results = classify_all([a, b])
+    assert len(results) == 2
+    assert {r.category for r in results} == {"Bass", "Lead"}
+
+
+def test_existing_dest_reused_not_wiped(tmp_path: Path):
+    src = tmp_path / "src"
+    dst = tmp_path / "dst"
+    src.mkdir()
+    (dst / "Bass").mkdir(parents=True)
+    keep = dst / "Bass" / "already.mid"
+    _write_simple_midi(keep, [40, 41])
+    marker = dst / "extra_note.txt"
+    marker.write_text("keep me")
+
+    _write_simple_midi(src / "BA_new.mid", [36, 38])
+    organize(src, dst, mode="copy")
+
+    assert keep.is_file()
+    assert marker.is_file()
+    assert (dst / "Bass" / "BA_new.mid").is_file()
+
+
+def test_dedupe_skips_content_already_in_dest(tmp_path: Path):
+    from shutil import copy2
+
+    src = tmp_path / "src"
+    dst = tmp_path / "dst"
+    src.mkdir()
+    (dst / "Drums").mkdir(parents=True)
+    existing = dst / "Drums" / "Kick.mid"
+    _write_simple_midi(existing, [36, 38])
+    copy2(existing, src / "Kick_again.mid")
+
+    results, counts = organize(src, dst, remove_duplicates=True)
+    assert sum(counts.values()) == 0
+    assert results[0].is_duplicate
+    assert results[0].dest is None
+    assert list(dst.rglob("*.mid")) == [existing]
+
+
+def test_organize_move(tmp_path: Path):
+    src = tmp_path / "src"
+    dst = tmp_path / "dst"
+    src.mkdir()
+    path = src / "BA_move.mid"
+    _write_simple_midi(path, [36, 38])
+
+    results, counts = organize(src, dst, mode="move")
+    assert counts["Bass"] == 1
+    assert not path.exists()
+    assert (dst / "Bass" / "BA_move.mid").is_file()
+    assert results[0].dest is not None

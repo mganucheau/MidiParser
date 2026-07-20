@@ -25,14 +25,15 @@ class MidiOrganizerApp(ctk.CTk):
     def __init__(self) -> None:
         super().__init__()
         self.title("MIDI Organizer")
-        self.geometry("960x680")
-        self.minsize(800, 560)
+        self.geometry("1000x720")
+        self.minsize(860, 600)
 
         ctk.set_appearance_mode("system")
         ctk.set_default_color_theme("blue")
 
         self._results: list[FileResult] = []
         self._busy = False
+        self._sources: list[str] = []
 
         self._build()
 
@@ -41,18 +42,37 @@ class MidiOrganizerApp(ctk.CTk):
         self.grid_columnconfigure(0, weight=1)
         self.grid_rowconfigure(3, weight=1)
 
-        # Source
+        # Sources (multi)
         src_frame = ctk.CTkFrame(self, fg_color="transparent")
         src_frame.grid(row=0, column=0, sticky="ew", **pad)
         src_frame.grid_columnconfigure(1, weight=1)
-        ctk.CTkLabel(src_frame, text="Source", width=90, anchor="w").grid(row=0, column=0)
-        self.source_var = tk.StringVar()
-        ctk.CTkEntry(src_frame, textvariable=self.source_var).grid(
-            row=0, column=1, sticky="ew", padx=(8, 8)
+        ctk.CTkLabel(src_frame, text="Sources", width=90, anchor="w").grid(
+            row=0, column=0, sticky="nw"
         )
-        ctk.CTkButton(src_frame, text="Browse", width=90, command=self._browse_source).grid(
-            row=0, column=2
+
+        list_wrap = ctk.CTkFrame(src_frame)
+        list_wrap.grid(row=0, column=1, sticky="ew", padx=(8, 8))
+        list_wrap.grid_columnconfigure(0, weight=1)
+        self.source_list = tk.Listbox(
+            list_wrap,
+            height=4,
+            activestyle="dotbox",
+            selectmode=tk.EXTENDED,
+            exportselection=False,
+            font=("SF Pro Text", 12),
         )
+        self.source_list.grid(row=0, column=0, sticky="ew")
+        src_scroll = ttk.Scrollbar(list_wrap, orient="vertical", command=self.source_list.yview)
+        self.source_list.configure(yscrollcommand=src_scroll.set)
+        src_scroll.grid(row=0, column=1, sticky="ns")
+
+        src_btns = ctk.CTkFrame(src_frame, fg_color="transparent")
+        src_btns.grid(row=0, column=2, sticky="n")
+        ctk.CTkButton(src_btns, text="Add", width=90, command=self._add_source).pack(pady=(0, 4))
+        ctk.CTkButton(src_btns, text="Remove", width=90, command=self._remove_sources).pack(
+            pady=(0, 4)
+        )
+        ctk.CTkButton(src_btns, text="Clear", width=90, command=self._clear_sources).pack()
 
         # Destination
         dst_frame = ctk.CTkFrame(self, fg_color="transparent")
@@ -74,9 +94,19 @@ class MidiOrganizerApp(ctk.CTk):
         self.scan_btn.pack(side="left", padx=(0, 8))
         self.org_btn = ctk.CTkButton(act, text="Organize", width=120, command=self._on_organize)
         self.org_btn.pack(side="left", padx=(0, 8))
+
+        self.mode_var = tk.StringVar(value="copy")
+        self.mode_seg = ctk.CTkSegmentedButton(
+            act,
+            values=["Copy", "Move"],
+            command=self._on_mode_change,
+        )
+        self.mode_seg.set("Copy")
+        self.mode_seg.pack(side="left", padx=(8, 0))
+
         self.dry_run_var = tk.BooleanVar(value=False)
         ctk.CTkCheckBox(act, text="Dry run", variable=self.dry_run_var).pack(
-            side="left", padx=(8, 0)
+            side="left", padx=(12, 0)
         )
         self.dedupe_var = tk.BooleanVar(value=False)
         ctk.CTkCheckBox(
@@ -114,14 +144,13 @@ class MidiOrganizerApp(ctk.CTk):
         self.tree.heading("relative", text="Relative path")
         self.tree.column("filename", width=220, stretch=True)
         self.tree.column("category", width=90, stretch=False)
-        self.tree.column("reason", width=80, stretch=False)
-        self.tree.column("relative", width=320, stretch=True)
+        self.tree.column("reason", width=140, stretch=False)
+        self.tree.column("relative", width=300, stretch=True)
         scroll = ttk.Scrollbar(table_frame, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=scroll.set)
         self.tree.grid(row=0, column=0, sticky="nsew")
         scroll.grid(row=0, column=1, sticky="ns")
 
-        # Counts panel
         counts = ctk.CTkFrame(mid, width=180)
         counts.grid(row=0, column=1, sticky="ns", padx=(4, 8), pady=8)
         counts.grid_propagate(False)
@@ -150,22 +179,51 @@ class MidiOrganizerApp(ctk.CTk):
         self.dup_label = ctk.CTkLabel(dup_row, text="0", anchor="e")
         self.dup_label.pack(side="right")
 
-        # Progress
         bot = ctk.CTkFrame(self, fg_color="transparent")
         bot.grid(row=4, column=0, sticky="ew", padx=16, pady=(0, 16))
         bot.grid_columnconfigure(0, weight=1)
         self.progress = ctk.CTkProgressBar(bot)
         self.progress.grid(row=0, column=0, sticky="ew")
         self.progress.set(0)
-        self.status_var = tk.StringVar(value="Pick a source folder and click Scan.")
+        self.status_var = tk.StringVar(value="Add one or more source folders and click Scan.")
         ctk.CTkLabel(bot, textvariable=self.status_var, anchor="w").grid(
             row=1, column=0, sticky="ew", pady=(6, 0)
         )
 
-    def _browse_source(self) -> None:
-        path = filedialog.askdirectory(title="Select source folder")
-        if path:
-            self.source_var.set(path)
+    def _on_mode_change(self, value: str) -> None:
+        self.mode_var.set(value.lower())
+
+    def _sync_source_list(self) -> None:
+        self.source_list.delete(0, tk.END)
+        for path in self._sources:
+            self.source_list.insert(tk.END, path)
+
+    def _add_source(self) -> None:
+        path = filedialog.askdirectory(title="Add source folder")
+        if not path:
+            return
+        resolved = str(Path(path).expanduser().resolve())
+        if resolved not in self._sources:
+            self._sources.append(resolved)
+            self._sync_source_list()
+            self._results = []
+            self.status_var.set(f"Added source ({len(self._sources)} total).")
+
+    def _remove_sources(self) -> None:
+        selected = list(self.source_list.curselection())
+        if not selected:
+            return
+        for index in reversed(selected):
+            del self._sources[index]
+        self._sync_source_list()
+        self._results = []
+        self.status_var.set(f"{len(self._sources)} source folder(s).")
+
+    def _clear_sources(self) -> None:
+        self._sources.clear()
+        self._sync_source_list()
+        self._results = []
+        self.status_var.set("Sources cleared.")
 
     def _browse_dest(self) -> None:
         path = filedialog.askdirectory(title="Select destination folder")
@@ -234,20 +292,24 @@ class MidiOrganizerApp(ctk.CTk):
     def _on_scan(self) -> None:
         if self._busy:
             return
-        source = self.source_var.get().strip()
-        if not source or not Path(source).is_dir():
-            self.status_var.set("Choose a valid source folder.")
+        if not self._sources:
+            self.status_var.set("Add at least one source folder.")
+            return
+        missing = [p for p in self._sources if not Path(p).is_dir()]
+        if missing:
+            self.status_var.set(f"Invalid source: {missing[0]}")
             return
 
         self._set_busy(True)
         self.status_var.set("Scanning…")
         self.progress.set(0)
+        sources = list(self._sources)
         remove_duplicates = self.dedupe_var.get()
 
         def work() -> None:
             try:
                 results = classify_all(
-                    source,
+                    sources,
                     progress=self._update_progress,
                     remove_duplicates=remove_duplicates,
                 )
@@ -268,23 +330,28 @@ class MidiOrganizerApp(ctk.CTk):
         self._fill_table(results)
         self.progress.set(1)
         dups = duplicate_count(results)
+        n_src = len(self._sources)
+        src_note = f" from {n_src} source(s)" if n_src > 1 else ""
         if self.dedupe_var.get() and dups:
             kept = len(results) - dups
             self.status_var.set(
-                f"Scan complete — {len(results)} file(s), {dups} duplicate(s) "
+                f"Scan complete — {len(results)} file(s){src_note}, {dups} duplicate(s) "
                 f"(will keep {kept})."
             )
         else:
-            self.status_var.set(f"Scan complete — {len(results)} MIDI file(s).")
+            self.status_var.set(f"Scan complete — {len(results)} MIDI file(s){src_note}.")
 
     def _on_organize(self) -> None:
         if self._busy:
             return
-        source = self.source_var.get().strip()
-        dest = self.dest_var.get().strip()
-        if not source or not Path(source).is_dir():
-            self.status_var.set("Choose a valid source folder.")
+        if not self._sources:
+            self.status_var.set("Add at least one source folder.")
             return
+        missing = [p for p in self._sources if not Path(p).is_dir()]
+        if missing:
+            self.status_var.set(f"Invalid source: {missing[0]}")
+            return
+        dest = self.dest_var.get().strip()
         if not dest:
             self.status_var.set("Choose a destination folder.")
             return
@@ -301,18 +368,22 @@ class MidiOrganizerApp(ctk.CTk):
 
         dry_run = self.dry_run_var.get()
         remove_duplicates = self.dedupe_var.get()
+        mode = self.mode_var.get() if self.mode_var.get() in {"copy", "move"} else "copy"
         self._set_busy(True)
-        self.status_var.set("Dry run…" if dry_run else "Organizing…")
+        action = "Dry run" if dry_run else ("Moving" if mode == "move" else "Copying")
+        self.status_var.set(f"{action}…")
         self.progress.set(0)
+        sources = list(self._sources)
         prior = list(self._results) if self._results else None
 
         def work() -> None:
             try:
                 results, counts = organize(
-                    source,
+                    sources,
                     dest,
                     dry_run=dry_run,
                     remove_duplicates=remove_duplicates,
+                    mode=mode,  # type: ignore[arg-type]
                     results=prior,
                     progress=self._update_progress,
                 )
@@ -322,7 +393,11 @@ class MidiOrganizerApp(ctk.CTk):
             self.after(
                 0,
                 lambda: self._organize_done(
-                    results, counts, dry_run=dry_run, remove_duplicates=remove_duplicates
+                    results,
+                    counts,
+                    dry_run=dry_run,
+                    remove_duplicates=remove_duplicates,
+                    mode=mode,
                 ),
             )
 
@@ -335,6 +410,7 @@ class MidiOrganizerApp(ctk.CTk):
         *,
         dry_run: bool = False,
         remove_duplicates: bool = False,
+        mode: str = "copy",
         error: str | None = None,
     ) -> None:
         self._set_busy(False)
@@ -346,7 +422,12 @@ class MidiOrganizerApp(ctk.CTk):
         self._fill_table(results)
         self.progress.set(1)
         parts = [f"{c}: {counts.get(c, 0)}" for c in CATEGORIES]
-        verb = "Dry run" if dry_run else "Organized"
+        if dry_run:
+            verb = "Dry run"
+        elif mode == "move":
+            verb = "Moved"
+        else:
+            verb = "Copied"
         dups = duplicate_count(results) if remove_duplicates else 0
         dup_note = f"  |  Skipped duplicates: {dups}" if dups else ""
         self.status_var.set(
