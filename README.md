@@ -35,3 +35,6 @@ Options:
 - **Copy / Move** — leave sources in place, or relocate them into the destination
 - **Dry run** — preview without copying or moving
 - **Remove duplicates** — skip identical content (SHA-256), including files already in the destination from a prior session
+- **Halt** — cancel an in-progress scan or copy/move
+
+While working, the status line shows the phase (discover / classify / transfer), counts, and the current path so you can tell the job is still moving. Large roots (e.g. `/`) spend a long time in **discover** before the determinate progress bar advances.

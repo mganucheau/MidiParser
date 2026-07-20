@@ -20,6 +20,7 @@ from midi_parser.organize import (
     mark_duplicates,
     organize,
 )
+from midi_parser.scan import ProgressUpdate
 
 
 class MidiOrganizerApp(ctk.CTk):
@@ -34,9 +35,9 @@ class MidiOrganizerApp(ctk.CTk):
 
         self._results: list[FileResult] = []
         self._busy = False
-        self._scanning = False
         self._sources: list[str] = []
         self._cancel_event = threading.Event()
+        self._discover_pulse = 0.05
 
         self._build()
 
@@ -95,16 +96,16 @@ class MidiOrganizerApp(ctk.CTk):
         act.grid(row=2, column=0, sticky="ew", **pad)
         self.scan_btn = ctk.CTkButton(act, text="Scan", width=100, command=self._on_scan)
         self.scan_btn.pack(side="left", padx=(0, 8))
-        self.stop_btn = ctk.CTkButton(
+        self.halt_btn = ctk.CTkButton(
             act,
-            text="Stop Scan",
-            width=100,
+            text="Halt",
+            width=80,
             fg_color="#8B3A3A",
             hover_color="#6E2E2E",
-            command=self._on_stop_scan,
+            command=self._on_halt,
             state="disabled",
         )
-        self.stop_btn.pack(side="left", padx=(0, 8))
+        self.halt_btn.pack(side="left", padx=(0, 8))
         self.org_btn = ctk.CTkButton(act, text="Organize", width=100, command=self._on_organize)
         self.org_btn.pack(side="left", padx=(0, 8))
 
@@ -202,6 +203,14 @@ class MidiOrganizerApp(ctk.CTk):
         ctk.CTkLabel(bot, textvariable=self.status_var, anchor="w").grid(
             row=1, column=0, sticky="ew", pady=(6, 0)
         )
+        self.detail_var = tk.StringVar(value="")
+        ctk.CTkLabel(
+            bot,
+            textvariable=self.detail_var,
+            anchor="w",
+            text_color=("gray40", "gray65"),
+            font=ctk.CTkFont(size=11),
+        ).grid(row=2, column=0, sticky="ew", pady=(2, 0))
 
     def _on_mode_change(self, value: str) -> None:
         self.mode_var.set(value.lower())
@@ -243,25 +252,32 @@ class MidiOrganizerApp(ctk.CTk):
         if path:
             self.dest_var.set(path)
 
-    def _set_busy(self, busy: bool, *, scanning: bool = False) -> None:
+    def _set_busy(self, busy: bool) -> None:
         self._busy = busy
-        self._scanning = scanning
         self.scan_btn.configure(state="disabled" if busy else "normal")
         self.org_btn.configure(state="disabled" if busy else "normal")
-        self.stop_btn.configure(state="normal" if scanning else "disabled")
+        self.halt_btn.configure(state="normal" if busy else "disabled")
 
-    def _on_stop_scan(self) -> None:
-        if not self._scanning:
+    def _on_halt(self) -> None:
+        if not self._busy:
             return
         self._cancel_event.set()
-        self.status_var.set("Stopping scan…")
-        self.stop_btn.configure(state="disabled")
+        self.status_var.set("Halting…")
+        self.halt_btn.configure(state="disabled")
 
-    def _update_progress(self, current: int, total: int, name: str) -> None:
+    def _update_progress(self, update: ProgressUpdate) -> None:
         def ui() -> None:
-            frac = (current / total) if total else 0.0
-            self.progress.set(frac)
-            self.status_var.set(f"{current} / {total}: {name}")
+            if update.total and update.total > 0:
+                self.progress.set(min(1.0, update.current / update.total))
+            else:
+                # Indeterminate pulse while discovering / hashing
+                self._discover_pulse = 0.05 + ((self._discover_pulse + 0.03) % 0.35)
+                self.progress.set(self._discover_pulse)
+            self.status_var.set(update.message)
+            detail = update.detail
+            if len(detail) > 120:
+                detail = "…" + detail[-119:]
+            self.detail_var.set(detail)
 
         self.after(0, ui)
 
@@ -322,11 +338,17 @@ class MidiOrganizerApp(ctk.CTk):
             return
 
         self._cancel_event.clear()
-        self._set_busy(True, scanning=True)
+        self._set_busy(True)
+        self._discover_pulse = 0.05
         self.status_var.set("Scanning…")
+        self.detail_var.set("")
         self.progress.set(0)
         sources = list(self._sources)
         remove_duplicates = self.dedupe_var.get()
+        if any(Path(p).resolve() == Path("/") for p in sources):
+            self.status_var.set(
+                "Scanning from / — this walks most of the disk. Use Halt to cancel."
+            )
 
         def work() -> None:
             try:
@@ -356,16 +378,19 @@ class MidiOrganizerApp(ctk.CTk):
         self._set_busy(False)
         self._cancel_event.clear()
         if cancelled:
-            self.status_var.set("Scan stopped.")
+            self.status_var.set("Halted.")
+            self.detail_var.set("")
             self.progress.set(0)
             return
         if error:
             self.status_var.set(f"Scan failed: {error}")
+            self.detail_var.set("")
             self.progress.set(0)
             return
         self._results = results
         self._fill_table(results)
         self.progress.set(1)
+        self.detail_var.set("")
         dups = duplicate_count(results)
         n_src = len(self._sources)
         src_note = f" from {n_src} source(s)" if n_src > 1 else ""
@@ -406,9 +431,12 @@ class MidiOrganizerApp(ctk.CTk):
         dry_run = self.dry_run_var.get()
         remove_duplicates = self.dedupe_var.get()
         mode = self.mode_var.get() if self.mode_var.get() in {"copy", "move"} else "copy"
+        self._cancel_event.clear()
         self._set_busy(True)
+        self._discover_pulse = 0.05
         action = "Dry run" if dry_run else ("Moving" if mode == "move" else "Copying")
         self.status_var.set(f"{action}…")
+        self.detail_var.set("")
         self.progress.set(0)
         sources = list(self._sources)
         prior = list(self._results) if self._results else None
@@ -423,7 +451,14 @@ class MidiOrganizerApp(ctk.CTk):
                     mode=mode,  # type: ignore[arg-type]
                     results=prior,
                     progress=self._update_progress,
+                    should_cancel=self._cancel_event.is_set,
                 )
+            except ScanCancelled:
+                self.after(
+                    0,
+                    lambda: self._organize_done([], {}, cancelled=True),
+                )
+                return
             except Exception as exc:  # noqa: BLE001
                 self.after(0, lambda: self._organize_done([], {}, error=str(exc)))
                 return
@@ -449,15 +484,24 @@ class MidiOrganizerApp(ctk.CTk):
         remove_duplicates: bool = False,
         mode: str = "copy",
         error: str | None = None,
+        cancelled: bool = False,
     ) -> None:
         self._set_busy(False)
+        self._cancel_event.clear()
+        if cancelled:
+            self.status_var.set("Halted.")
+            self.detail_var.set("")
+            self.progress.set(0)
+            return
         if error:
             self.status_var.set(f"Organize failed: {error}")
+            self.detail_var.set("")
             self.progress.set(0)
             return
         self._results = results
         self._fill_table(results)
         self.progress.set(1)
+        self.detail_var.set("")
         parts = [f"{c}: {counts.get(c, 0)}" for c in CATEGORIES]
         if dry_run:
             verb = "Dry run"

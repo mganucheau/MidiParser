@@ -12,9 +12,13 @@ from typing import Literal
 from midi_parser import CATEGORIES
 from midi_parser.assess import assess_file
 from midi_parser.name_hints import category_from_name
-from midi_parser.scan import ScanCancelled, find_midi_files_with_roots
+from midi_parser.scan import (
+    ProgressCallback,
+    ProgressUpdate,
+    ScanCancelled,
+    find_midi_files_with_roots,
+)
 
-ProgressCallback = Callable[[int, int, str], None]
 CancelCallback = Callable[[], bool]
 TransferMode = Literal["copy", "move"]
 
@@ -126,14 +130,26 @@ def classify_all(
 
     Raises ScanCancelled if should_cancel returns True.
     """
-    entries = find_midi_files_with_roots(sources, should_cancel=should_cancel)
+    entries = find_midi_files_with_roots(
+        sources,
+        should_cancel=should_cancel,
+        progress=progress,
+    )
     results: list[FileResult] = []
     total = len(entries)
     for i, (path, _root, relative) in enumerate(entries, start=1):
         if should_cancel and should_cancel():
             raise ScanCancelled()
         if progress:
-            progress(i, total, path.name)
+            progress(
+                ProgressUpdate(
+                    phase="classify",
+                    message=f"Classifying {i:,} / {total:,}",
+                    current=i,
+                    total=total,
+                    detail=str(path),
+                )
+            )
         results.append(classify_file(path, relative=relative))
     if remove_duplicates:
         mark_duplicates(results)
@@ -181,7 +197,12 @@ def _ensure_category_dirs(dest_root: Path, categories: Iterable[str]) -> None:
             folder.mkdir(parents=True, exist_ok=True)
 
 
-def existing_dest_hashes(dest_root: Path) -> dict[str, str]:
+def existing_dest_hashes(
+    dest_root: Path,
+    *,
+    progress: ProgressCallback | None = None,
+    should_cancel: CancelCallback | None = None,
+) -> dict[str, str]:
     """
     Hash MIDI files already in dest category folders.
 
@@ -191,13 +212,27 @@ def existing_dest_hashes(dest_root: Path) -> dict[str, str]:
     root = Path(dest_root)
     if not root.is_dir():
         return hashes
+    n = 0
     for category in CATEGORIES:
         folder = root / category
         if not folder.is_dir():
             continue
         for path in folder.rglob("*"):
+            if should_cancel and should_cancel():
+                raise ScanCancelled()
             if not path.is_file() or path.suffix.lower() not in {".mid", ".midi"}:
                 continue
+            n += 1
+            if progress and n % 25 == 0:
+                progress(
+                    ProgressUpdate(
+                        phase="hash_dest",
+                        message=f"Checking existing library… {n:,} files",
+                        current=n,
+                        total=0,
+                        detail=str(path),
+                    )
+                )
             try:
                 digest = file_content_hash(path)
             except OSError:
@@ -239,6 +274,7 @@ def organize(
     mode: TransferMode = "copy",
     results: list[FileResult] | None = None,
     progress: ProgressCallback | None = None,
+    should_cancel: CancelCallback | None = None,
 ) -> tuple[list[FileResult], dict[str, int]]:
     """
     Classify (if needed) and copy/move files into dest/<Category>/.
@@ -248,6 +284,8 @@ def organize(
 
     When remove_duplicates is True, skips content already in the destination
     and later source duplicates with the same hash.
+
+    Raises ScanCancelled if should_cancel returns True.
     """
     dest_root = Path(dest).expanduser().resolve()
 
@@ -256,9 +294,18 @@ def organize(
             sources,
             progress=progress,
             remove_duplicates=False,
+            should_cancel=should_cancel,
         )
 
-    existing = existing_dest_hashes(dest_root) if remove_duplicates else {}
+    existing = (
+        existing_dest_hashes(
+            dest_root,
+            progress=progress,
+            should_cancel=should_cancel,
+        )
+        if remove_duplicates
+        else {}
+    )
     if remove_duplicates:
         mark_duplicates(results, existing_hashes=existing)
     else:
@@ -266,25 +313,47 @@ def organize(
 
     needed = {r.category for r in results if not (remove_duplicates and r.is_duplicate)}
     if not dry_run:
+        if should_cancel and should_cancel():
+            raise ScanCancelled()
         dest_root.mkdir(parents=True, exist_ok=True)
         _ensure_category_dirs(dest_root, needed)
 
     total = len(results)
+    transferred = 0
     for i, result in enumerate(results, start=1):
-        if progress:
-            progress(i, total, result.filename)
+        if should_cancel and should_cancel():
+            raise ScanCancelled()
 
         if remove_duplicates and result.is_duplicate:
             result.dest = None
+            if progress:
+                progress(
+                    ProgressUpdate(
+                        phase="transfer",
+                        message=f"Transfer {i:,} / {total:,} (skip duplicate)",
+                        current=i,
+                        total=total,
+                        detail=result.relative,
+                    )
+                )
             continue
 
         folder = dest_root / result.category
         if dry_run and not folder.exists():
-            # Preview path without creating folders
             target = folder / result.filename
             if target.exists():
                 target = _unique_dest(folder, result.filename)
             result.dest = target
+            if progress:
+                progress(
+                    ProgressUpdate(
+                        phase="transfer",
+                        message=f"Dry run {i:,} / {total:,}",
+                        current=i,
+                        total=total,
+                        detail=result.relative,
+                    )
+                )
             continue
 
         if not dry_run:
@@ -293,5 +362,19 @@ def organize(
         result.dest = target
         if not dry_run:
             _transfer(result.source, target, mode)
+            transferred += 1
+        if progress:
+            verb = "Moving" if mode == "move" else "Copying"
+            if dry_run:
+                verb = "Dry run"
+            progress(
+                ProgressUpdate(
+                    phase="transfer",
+                    message=f"{verb} {i:,} / {total:,}",
+                    current=i,
+                    total=total,
+                    detail=str(target),
+                )
+            )
 
     return results, count_by_category(results, exclude_duplicates=remove_duplicates)
