@@ -236,3 +236,21 @@ def test_organize_move(tmp_path: Path):
     assert not path.exists()
     assert (dst / "Bass" / "BA_move.mid").is_file()
     assert results[0].dest is not None
+
+
+def test_scan_can_be_cancelled(tmp_path: Path):
+    from midi_parser.organize import ScanCancelled, classify_all
+
+    src = tmp_path / "src"
+    src.mkdir()
+    for i in range(5):
+        _write_simple_midi(src / f"BA_{i}.mid", [36 + i])
+
+    calls = {"n": 0}
+
+    def should_cancel() -> bool:
+        calls["n"] += 1
+        return calls["n"] > 2
+
+    with pytest.raises(ScanCancelled):
+        classify_all(src, should_cancel=should_cancel)

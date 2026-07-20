@@ -13,6 +13,7 @@ from midi_parser import CATEGORIES
 from midi_parser.name_hints import category_from_name
 from midi_parser.organize import (
     FileResult,
+    ScanCancelled,
     classify_all,
     count_by_category,
     duplicate_count,
@@ -33,7 +34,9 @@ class MidiOrganizerApp(ctk.CTk):
 
         self._results: list[FileResult] = []
         self._busy = False
+        self._scanning = False
         self._sources: list[str] = []
+        self._cancel_event = threading.Event()
 
         self._build()
 
@@ -90,9 +93,19 @@ class MidiOrganizerApp(ctk.CTk):
         # Actions
         act = ctk.CTkFrame(self, fg_color="transparent")
         act.grid(row=2, column=0, sticky="ew", **pad)
-        self.scan_btn = ctk.CTkButton(act, text="Scan", width=120, command=self._on_scan)
+        self.scan_btn = ctk.CTkButton(act, text="Scan", width=100, command=self._on_scan)
         self.scan_btn.pack(side="left", padx=(0, 8))
-        self.org_btn = ctk.CTkButton(act, text="Organize", width=120, command=self._on_organize)
+        self.stop_btn = ctk.CTkButton(
+            act,
+            text="Stop Scan",
+            width=100,
+            fg_color="#8B3A3A",
+            hover_color="#6E2E2E",
+            command=self._on_stop_scan,
+            state="disabled",
+        )
+        self.stop_btn.pack(side="left", padx=(0, 8))
+        self.org_btn = ctk.CTkButton(act, text="Organize", width=100, command=self._on_organize)
         self.org_btn.pack(side="left", padx=(0, 8))
 
         self.mode_var = tk.StringVar(value="copy")
@@ -230,11 +243,19 @@ class MidiOrganizerApp(ctk.CTk):
         if path:
             self.dest_var.set(path)
 
-    def _set_busy(self, busy: bool) -> None:
+    def _set_busy(self, busy: bool, *, scanning: bool = False) -> None:
         self._busy = busy
-        state = "disabled" if busy else "normal"
-        self.scan_btn.configure(state=state)
-        self.org_btn.configure(state=state)
+        self._scanning = scanning
+        self.scan_btn.configure(state="disabled" if busy else "normal")
+        self.org_btn.configure(state="disabled" if busy else "normal")
+        self.stop_btn.configure(state="normal" if scanning else "disabled")
+
+    def _on_stop_scan(self) -> None:
+        if not self._scanning:
+            return
+        self._cancel_event.set()
+        self.status_var.set("Stopping scan…")
+        self.stop_btn.configure(state="disabled")
 
     def _update_progress(self, current: int, total: int, name: str) -> None:
         def ui() -> None:
@@ -300,7 +321,8 @@ class MidiOrganizerApp(ctk.CTk):
             self.status_var.set(f"Invalid source: {missing[0]}")
             return
 
-        self._set_busy(True)
+        self._cancel_event.clear()
+        self._set_busy(True, scanning=True)
         self.status_var.set("Scanning…")
         self.progress.set(0)
         sources = list(self._sources)
@@ -312,7 +334,11 @@ class MidiOrganizerApp(ctk.CTk):
                     sources,
                     progress=self._update_progress,
                     remove_duplicates=remove_duplicates,
+                    should_cancel=self._cancel_event.is_set,
                 )
+            except ScanCancelled:
+                self.after(0, lambda: self._scan_done([], cancelled=True))
+                return
             except Exception as exc:  # noqa: BLE001
                 self.after(0, lambda: self._scan_done([], error=str(exc)))
                 return
@@ -320,8 +346,19 @@ class MidiOrganizerApp(ctk.CTk):
 
         threading.Thread(target=work, daemon=True).start()
 
-    def _scan_done(self, results: list[FileResult], error: str | None = None) -> None:
+    def _scan_done(
+        self,
+        results: list[FileResult],
+        error: str | None = None,
+        *,
+        cancelled: bool = False,
+    ) -> None:
         self._set_busy(False)
+        self._cancel_event.clear()
+        if cancelled:
+            self.status_var.set("Scan stopped.")
+            self.progress.set(0)
+            return
         if error:
             self.status_var.set(f"Scan failed: {error}")
             self.progress.set(0)

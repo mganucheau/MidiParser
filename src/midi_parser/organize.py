@@ -12,9 +12,10 @@ from typing import Literal
 from midi_parser import CATEGORIES
 from midi_parser.assess import assess_file
 from midi_parser.name_hints import category_from_name
-from midi_parser.scan import find_midi_files_with_roots
+from midi_parser.scan import ScanCancelled, find_midi_files_with_roots
 
 ProgressCallback = Callable[[int, int, str], None]
+CancelCallback = Callable[[], bool]
 TransferMode = Literal["copy", "move"]
 
 
@@ -119,12 +120,18 @@ def classify_all(
     progress: ProgressCallback | None = None,
     *,
     remove_duplicates: bool = False,
+    should_cancel: CancelCallback | None = None,
 ) -> list[FileResult]:
-    """Scan one or more source roots and classify every MIDI file."""
-    entries = find_midi_files_with_roots(sources)
+    """Scan one or more source roots and classify every MIDI file.
+
+    Raises ScanCancelled if should_cancel returns True.
+    """
+    entries = find_midi_files_with_roots(sources, should_cancel=should_cancel)
     results: list[FileResult] = []
     total = len(entries)
     for i, (path, _root, relative) in enumerate(entries, start=1):
+        if should_cancel and should_cancel():
+            raise ScanCancelled()
         if progress:
             progress(i, total, path.name)
         results.append(classify_file(path, relative=relative))

@@ -2,9 +2,15 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from pathlib import Path
 
 MIDI_SUFFIXES = {".mid", ".midi"}
+CancelCallback = Callable[[], bool]
+
+
+class ScanCancelled(Exception):
+    """Raised when a scan is stopped by the user."""
 
 
 def _normalize_roots(sources: Path | str | list[Path | str]) -> list[Path]:
@@ -35,19 +41,25 @@ def find_midi_files(source: Path | str) -> list[Path]:
 
 def find_midi_files_with_roots(
     sources: Path | str | list[Path | str],
+    *,
+    should_cancel: CancelCallback | None = None,
 ) -> list[tuple[Path, Path, str]]:
     """
     Find MIDI files under one or more source roots.
 
     Returns list of (absolute_path, source_root, display_relative).
     With multiple roots, display_relative is ``RootName/relative/path``.
+
+    Raises ScanCancelled if should_cancel returns True mid-walk.
     """
     roots = _normalize_roots(sources)
     multi = len(roots) > 1
     found: list[tuple[Path, Path, str]] = []
 
     for root in roots:
-        for path in root.rglob("*"):
+        for i, path in enumerate(root.rglob("*")):
+            if should_cancel and i % 50 == 0 and should_cancel():
+                raise ScanCancelled()
             if not path.is_file():
                 continue
             if path.suffix.lower() not in MIDI_SUFFIXES:
