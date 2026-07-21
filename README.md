@@ -29,7 +29,7 @@ python -m midi_parser
 
 ### Recommended: collect whole-disk MIDI, then sort
 
-1. Click **Collect MIDI…** and choose a dump folder — copies every `.mid` / `.midi` from `/` into that one folder (**no classification**; walk + copy only)
+1. Click **Collect MIDI…** and choose a dump folder — copies every `.mid` / `.midi` by extension into that one folder (**no hashing or classification**; skips `/Volumes`)
 2. When prompted, add the dump folder as a source (or **Add** it yourself)
 3. Browse to an organize **destination** (category library)
 4. Click **Scan** to classify, then **Organize**
@@ -43,7 +43,7 @@ python -m midi_parser
 
 Options:
 
-- **Collect MIDI…** — fast whole-computer dump into one folder (no parsing). Prefer this over Scan Computer when you only need to gather files first. If the destination runs out of space, collect **pauses** and **resumes automatically** when enough free space is available (use **Halt** to stop).
+- **Collect MIDI…** — copy all `.mid` / `.midi` into one folder by extension (no hashing/parsing). Skips `/Volumes` (NAS). Prefer this over Scan Computer when you only need to gather files first. If the destination runs out of space, collect **pauses** and **resumes automatically** when enough free space is available (use **Halt** to stop).
 - **Scan Computer** — whole-disk discovery from `/` **and classify every file** (opens each MIDI; can take many hours). Crash-safe checkpoints in `~/.midi_parser/`.
 - **Resume Scan** — continue a halted or crashed whole-computer *classify* scan
 - **Copy / Move** — leave sources in place, or relocate them into the destination

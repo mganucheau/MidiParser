@@ -866,10 +866,10 @@ class MidiOrganizerApp(ctk.CTk):
             return
         ok = messagebox.askokcancel(
             "Collect MIDI",
-            "Copy all MIDI files from this computer (/) into one folder.\n\n"
-            "Does not classify — walk + copy only (much faster).\n"
-            "If the disk fills up, collect pauses and resumes when space is free "
-            "(Halt to stop).\n"
+            "Copy every .mid / .midi file from this Mac into one folder.\n\n"
+            "Extension match + copy only (no hashing, no classify).\n"
+            "Skips /Volumes (network drives) so NAS mounts don’t stall the run.\n"
+            "If the disk fills up, pauses until space is free (Halt to stop).\n"
             "Afterward, Add that folder as a source and Scan to sort.",
         )
         if not ok:

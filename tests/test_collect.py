@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from midi_parser.collect import collect_midi
+from midi_parser.collect import _filter_dirnames, collect_midi
 from midi_parser.scan import ScanCancelled
 
 
@@ -49,7 +49,8 @@ def test_collect_collision_safe_names(tmp_path: Path) -> None:
     assert bodies == {b"one", b"two"}
 
 
-def test_collect_skips_same_name_same_size_on_rerun(tmp_path: Path) -> None:
+def test_collect_rerun_copies_again_unique_name(tmp_path: Path) -> None:
+    """No hashing — re-run copies again with a collision-safe name."""
     src = tmp_path / "library"
     dest = tmp_path / "dump"
     _write_midi(src / "x" / "clip.mid", b"same")
@@ -58,9 +59,9 @@ def test_collect_skips_same_name_same_size_on_rerun(tmp_path: Path) -> None:
     second = collect_midi(src, dest)
 
     assert first.copied == 1
-    assert second.copied == 0
-    assert second.skipped == 1
-    assert list(dest.iterdir()) == [dest / "clip.mid"]
+    assert second.copied == 1
+    names = sorted(p.name for p in dest.iterdir())
+    assert names == ["clip.mid", "clip_1.mid"]
 
 
 def test_collect_does_not_walk_into_dest(tmp_path: Path) -> None:
@@ -72,11 +73,21 @@ def test_collect_does_not_walk_into_dest(tmp_path: Path) -> None:
 
     stats = collect_midi(root, dest)
 
-    # Should find outer only; not re-copy already.mid from dest
     assert stats.found == 1
     assert stats.copied == 1
     assert (dest / "outer.mid").read_bytes() == b"outer"
     assert (dest / "already.mid").read_bytes() == b"inside"
+
+
+def test_filter_skips_volumes_at_root(tmp_path: Path) -> None:
+    dest = tmp_path / "dump"
+    dest.mkdir()
+    names = ["Users", "Volumes", "Applications", "System"]
+    _filter_dirnames("/", names, dest_root=dest, skip_volumes=True)
+    assert "Volumes" not in names
+    assert "System" not in names
+    assert "Users" in names
+    assert "Applications" in names
 
 
 def test_collect_cancel(tmp_path: Path) -> None:

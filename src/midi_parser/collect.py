@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import errno
-import hashlib
 import os
 import shutil
 import time
@@ -23,6 +22,19 @@ from midi_parser.util import format_size
 
 # Extra headroom beyond the file size before treating disk as "enough space"
 _SPACE_MARGIN = 64 * 1024
+
+# Top-level dirs under / to skip (network mounts, system noise)
+_SKIP_ROOT_DIR_NAMES = frozenset(
+    {
+        "Volumes",  # NAS / external — dominates runtime; skip by default
+        "System",
+        "private",
+        "dev",
+        "net",
+        "home",  # macOS automount stub
+        "cores",
+    }
+)
 
 
 @dataclass
@@ -52,34 +64,6 @@ def _unique_dest(folder: Path, filename: str) -> Path:
         n += 1
 
 
-def _content_hash(path: Path) -> str | None:
-    try:
-        h = hashlib.sha256()
-        with path.open("rb") as f:
-            for chunk in iter(lambda: f.read(1024 * 1024), b""):
-                h.update(chunk)
-        return h.hexdigest()
-    except OSError:
-        return None
-
-
-def _dest_hashes(dest_root: Path) -> set[str]:
-    """SHA-256 digests of MIDI already in the dump folder (for re-run skip)."""
-    seen: set[str] = set()
-    try:
-        for entry in dest_root.iterdir():
-            if not entry.is_file():
-                continue
-            if entry.suffix.lower() not in MIDI_SUFFIXES:
-                continue
-            digest = _content_hash(entry)
-            if digest:
-                seen.add(digest)
-    except OSError:
-        pass
-    return seen
-
-
 def _is_under(path: Path, root: Path) -> bool:
     try:
         path.resolve().relative_to(root)
@@ -94,7 +78,6 @@ def _is_no_space(exc: BaseException) -> bool:
     code = getattr(exc, "errno", None)
     if code in (errno.ENOSPC, errno.EDQUOT):
         return True
-    # Some platforms put errno only on args
     if exc.args and exc.args[0] in (errno.ENOSPC, errno.EDQUOT):
         return True
     msg = str(exc).lower()
@@ -133,11 +116,7 @@ def _wait_for_space(
     should_cancel: CancelCallback | None,
     poll_seconds: float = 2.0,
 ) -> None:
-    """
-    Block until ``dest_root`` has at least ``needed`` free bytes, or cancel.
-
-    Raises ScanCancelled if should_cancel becomes true.
-    """
+    """Block until ``dest_root`` has enough free bytes, or cancel."""
     need = max(needed, 1)
     while True:
         if should_cancel and should_cancel():
@@ -169,7 +148,6 @@ def _wait_for_space(
                     detail=str(dest_root),
                 )
             )
-        # Short sleeps so Halt stays responsive
         slept = 0.0
         while slept < poll_seconds:
             if should_cancel and should_cancel():
@@ -188,12 +166,7 @@ def _copy_with_space_retry(
     should_cancel: CancelCallback | None,
     poll_seconds: float,
 ) -> bool:
-    """
-    Copy ``src`` into ``dest_root`` with collision-safe naming.
-
-    On disk-full, pauses until space returns and retries the same file.
-    Returns True if copied, False if a non-space error occurred.
-    """
+    """Copy ``src`` into ``dest_root``; pause/retry on disk full."""
     needed = _file_size(src) + _SPACE_MARGIN
     while True:
         if should_cancel and should_cancel():
@@ -216,6 +189,33 @@ def _copy_with_space_retry(
             )
 
 
+def _filter_dirnames(
+    dirpath: str,
+    dirnames: list[str],
+    *,
+    dest_root: Path,
+    skip_volumes: bool,
+) -> None:
+    """Mutate dirnames in-place for os.walk pruning."""
+    at_fs_root = dirpath.rstrip("/") == "" or dirpath == "/"
+    kept: list[str] = []
+    for name in dirnames:
+        if name.startswith(".") or name in _SKIP_DIR_NAMES:
+            continue
+        if skip_volumes and name == "Volumes":
+            continue
+        if skip_volumes and at_fs_root and name in _SKIP_ROOT_DIR_NAMES:
+            continue
+        child = Path(dirpath) / name
+        try:
+            if _is_under(child, dest_root) or child.resolve() == dest_root:
+                continue
+        except OSError:
+            pass
+        kept.append(name)
+    dirnames[:] = kept
+
+
 def collect_midi(
     roots: Path | str | list[Path | str],
     dest: Path | str,
@@ -223,15 +223,16 @@ def collect_midi(
     progress: ProgressCallback | None = None,
     should_cancel: CancelCallback | None = None,
     space_poll_seconds: float = 2.0,
+    skip_volumes: bool = True,
 ) -> CollectStats:
     """
-    Walk roots for .mid / .midi and copy each into ``dest`` (flat folder).
+    Walk roots for ``.mid`` / ``.midi`` by extension and copy into ``dest``.
 
-    No classification or MIDI parsing. Collision-safe names; skips when dest
-    already holds identical content (SHA-256). Does not walk into ``dest``.
+    No classification, no content hashing — extension match + copy only.
+    Collision-safe names. Skips ``/Volumes`` (and other noisy root dirs) by
+    default. Does not walk into ``dest``.
 
-    If the destination volume runs out of space, the collect **pauses** and
-    automatically **resumes** when enough free space is available (Halt cancels).
+    If the destination runs out of space, pauses until free space returns.
     """
     dest_root = Path(dest).expanduser().resolve()
     dest_root.mkdir(parents=True, exist_ok=True)
@@ -242,7 +243,7 @@ def collect_midi(
 
     stats = CollectStats()
     last_report = 0
-    known_hashes = _dest_hashes(dest_root)
+    dest_prefix = str(dest_root) + os.sep
 
     def report(detail: str) -> None:
         nonlocal last_report
@@ -283,27 +284,28 @@ def collect_midi(
             if should_cancel and should_cancel():
                 raise ScanCancelled()
 
-            kept: list[str] = []
-            for name in dirnames:
-                if name.startswith(".") or name in _SKIP_DIR_NAMES:
-                    continue
-                child = Path(dirpath) / name
-                try:
-                    if _is_under(child, dest_root) or child.resolve() == dest_root:
-                        continue
-                except OSError:
-                    pass
-                kept.append(name)
-            dirnames[:] = kept
+            # Bail out if we somehow entered Volumes or dest
+            if skip_volumes and (
+                dirpath == "/Volumes" or dirpath.startswith("/Volumes/")
+            ):
+                dirnames.clear()
+                continue
+            if dirpath == str(dest_root) or dirpath.startswith(dest_prefix):
+                dirnames.clear()
+                continue
+
+            _filter_dirnames(
+                dirpath,
+                dirnames,
+                dest_root=dest_root,
+                skip_volumes=skip_volumes,
+            )
 
             stats.walked += 1 + len(filenames)
             report(dirpath)
 
             try:
                 current = Path(dirpath)
-                if _is_under(current, dest_root) or current.resolve() == dest_root:
-                    dirnames.clear()
-                    continue
                 rel_dir = current.relative_to(root)
             except ValueError:
                 continue
@@ -319,21 +321,13 @@ def collect_midi(
                     continue
                 path = current / name
                 try:
-                    if not path.is_file():
-                        continue
-                    resolved = path.resolve()
-                    if resolved == dest_root or _is_under(resolved, dest_root):
+                    if not path.is_file() or path.is_symlink():
                         continue
                 except OSError:
                     stats.errors += 1
                     continue
 
                 stats.found += 1
-                digest = _content_hash(path)
-                if digest and digest in known_hashes:
-                    stats.skipped += 1
-                    continue
-
                 ok = _copy_with_space_retry(
                     path,
                     dest_root,
@@ -345,8 +339,6 @@ def collect_midi(
                 )
                 if ok:
                     stats.copied += 1
-                    if digest:
-                        known_hashes.add(digest)
                 else:
                     stats.errors += 1
 
@@ -370,7 +362,7 @@ def collect_midi(
                 phase="collect",
                 message=(
                     f"Collect done — copied {stats.copied:,} of {stats.found:,} MIDI "
-                    f"(skipped {stats.skipped:,}, errors {stats.errors:,})"
+                    f"(errors {stats.errors:,})"
                 ),
                 current=stats.walked,
                 total=0,
