@@ -12,6 +12,7 @@ import customtkinter as ctk
 
 from midi_parser import CATEGORIES
 from midi_parser.checkpoint import clear_checkpoint, load_checkpoint
+from midi_parser.collect import CollectStats, collect_midi
 from midi_parser.name_hints import category_from_name
 from midi_parser.organize import (
     FileResult,
@@ -273,8 +274,12 @@ class MidiOrganizerApp(ctk.CTk):
             src_btns, "Scan Computer", self._on_scan_computer
         )
         self.scan_computer_btn.grid(row=1, column=1, sticky="ew", padx=(4, 0), pady=(0, 4))
+        self.collect_btn = self._secondary_btn(
+            src_btns, "Collect MIDI…", self._on_collect_midi
+        )
+        self.collect_btn.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(0, 4))
         self.resume_btn = self._secondary_btn(src_btns, "Resume Scan", self._on_resume_scan)
-        self.resume_btn.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(0, 8))
+        self.resume_btn.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(0, 8))
         self.resume_btn.configure(state="disabled")
 
         # DESTINATION
@@ -484,7 +489,9 @@ class MidiOrganizerApp(ctk.CTk):
         self.progress.grid(row=0, column=0, sticky="ew")
         self.progress.set(0)
 
-        self.status_var = tk.StringVar(value="Add source folders, or Scan Computer.")
+        self.status_var = tk.StringVar(
+            value="Add sources, Collect MIDI… (fast dump), or Scan to classify."
+        )
         ctk.CTkLabel(
             inner,
             textvariable=self.status_var,
@@ -685,6 +692,7 @@ class MidiOrganizerApp(ctk.CTk):
         self.scan_btn.configure(state=state)
         self.org_btn.configure(state=state)
         self.scan_computer_btn.configure(state=state)
+        self.collect_btn.configure(state=state)
         self.halt_btn.configure(state="normal" if busy else "disabled")
         if busy:
             self.resume_btn.configure(state="disabled")
@@ -819,9 +827,10 @@ class MidiOrganizerApp(ctk.CTk):
                 self.after(0, lambda: self._scan_done([], cancelled=True))
                 return
             except Exception as exc:  # noqa: BLE001
-                self.after(0, lambda: self._scan_done([], error=str(exc)))
+                err = str(exc)
+                self.after(0, lambda e=err: self._scan_done([], error=e))
                 return
-            self.after(0, lambda: self._scan_done(results))
+            self.after(0, lambda r=results: self._scan_done(r))
 
         threading.Thread(target=work, daemon=True).start()
 
@@ -843,13 +852,99 @@ class MidiOrganizerApp(ctk.CTk):
         else:
             ok = messagebox.askokcancel(
                 "Scan Computer",
-                "Scan the entire computer from / for MIDI files.\n\n"
-                "Progress is saved continuously so you can Halt and Resume later.\n"
-                "This can take a long time.",
+                "Scan the entire computer from / and classify every MIDI file.\n\n"
+                "This parses each file and can take many hours.\n"
+                "For a fast dump into one folder, use Collect MIDI… instead.\n\n"
+                "Progress is saved so you can Halt and Resume.",
             )
             if not ok:
                 return
         self._start_checkpoint_scan(resume=False)
+
+    def _on_collect_midi(self) -> None:
+        if self._busy:
+            return
+        ok = messagebox.askokcancel(
+            "Collect MIDI",
+            "Copy all MIDI files from this computer (/) into one folder.\n\n"
+            "Does not classify — walk + copy only (much faster).\n"
+            "If the disk fills up, collect pauses and resumes when space is free "
+            "(Halt to stop).\n"
+            "Afterward, Add that folder as a source and Scan to sort.",
+        )
+        if not ok:
+            return
+        dest = filedialog.askdirectory(title="Choose folder to collect MIDI into")
+        if not dest:
+            return
+        dest_resolved = str(Path(dest).expanduser().resolve())
+        self._begin_job(f"Collecting MIDI into {dest_resolved}…")
+
+        def work() -> None:
+            try:
+                stats = collect_midi(
+                    "/",
+                    dest_resolved,
+                    progress=self._update_progress,
+                    should_cancel=self._cancel_event.is_set,
+                )
+            except ScanCancelled:
+                self.after(
+                    0,
+                    lambda: self._collect_done(None, cancelled=True, dest=dest_resolved),
+                )
+                return
+            except Exception as exc:  # noqa: BLE001
+                err = str(exc)
+                self.after(
+                    0,
+                    lambda e=err: self._collect_done(None, error=e, dest=dest_resolved),
+                )
+                return
+            self.after(
+                0,
+                lambda s=stats: self._collect_done(s, dest=dest_resolved),
+            )
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _collect_done(
+        self,
+        stats: CollectStats | None,
+        *,
+        dest: str,
+        error: str | None = None,
+        cancelled: bool = False,
+    ) -> None:
+        self._set_busy(False)
+        self.progress.set(0)
+        elapsed = self.timer_var.get()
+        if error:
+            self.status_var.set(f"Collect failed: {error}")
+            self.detail_var.set("")
+            messagebox.showerror("Collect failed", error)
+            return
+        if cancelled:
+            self.status_var.set(f"Collect halted.  ({elapsed})")
+            self.detail_var.set(dest)
+            return
+        assert stats is not None
+        msg = (
+            f"Collected {stats.copied:,} MIDI "
+            f"(found {stats.found:,}, skipped {stats.skipped:,}, "
+            f"errors {stats.errors:,})  ({elapsed})"
+        )
+        self.status_var.set(msg)
+        self.detail_var.set(dest)
+        add = messagebox.askyesno(
+            "Collect complete",
+            f"{msg}\n\nDestination:\n{dest}\n\n"
+            "Add this folder as a source so you can Scan and Organize?",
+        )
+        if add and dest not in self._sources:
+            self._sources.append(dest)
+            self._sync_source_list()
+            self.status_var.set(f"{msg} — added as source.")
 
     def _on_resume_scan(self) -> None:
         if self._busy:
@@ -893,9 +988,16 @@ class MidiOrganizerApp(ctk.CTk):
                 self.after(0, lambda: self._scan_done([], cancelled=True, checkpointed=True))
                 return
             except Exception as exc:  # noqa: BLE001
-                self.after(0, lambda: self._scan_done([], error=str(exc), checkpointed=True))
+                err = str(exc)
+                self.after(
+                    0,
+                    lambda e=err: self._scan_done([], error=e, checkpointed=True),
+                )
                 return
-            self.after(0, lambda: self._scan_done(results, checkpointed=True, finished=True))
+            self.after(
+                0,
+                lambda r=results: self._scan_done(r, checkpointed=True, finished=True),
+            )
 
         threading.Thread(target=work, daemon=True).start()
 
@@ -999,16 +1101,17 @@ class MidiOrganizerApp(ctk.CTk):
                 self.after(0, lambda: self._organize_done([], {}, cancelled=True))
                 return
             except Exception as exc:  # noqa: BLE001
-                self.after(0, lambda: self._organize_done([], {}, error=str(exc)))
+                err = str(exc)
+                self.after(0, lambda e=err: self._organize_done([], {}, error=e))
                 return
             self.after(
                 0,
-                lambda: self._organize_done(
-                    results,
-                    counts,
-                    dry_run=dry_run,
-                    remove_duplicates=remove_duplicates,
-                    mode=mode,
+                lambda r=results, c=counts, d=dry_run, rd=remove_duplicates, m=mode: self._organize_done(
+                    r,
+                    c,
+                    dry_run=d,
+                    remove_duplicates=rd,
+                    mode=m,
                 ),
             )
 
