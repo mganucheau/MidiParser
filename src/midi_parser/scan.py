@@ -7,6 +7,13 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
+from midi_parser.checkpoint import (
+    FoundEntry,
+    ScanCheckpoint,
+    new_checkpoint,
+    save_checkpoint,
+)
+
 MIDI_SUFFIXES = {".mid", ".midi"}
 CancelCallback = Callable[[], bool]
 
@@ -66,6 +73,13 @@ def _normalize_roots(sources: Path | str | list[Path | str]) -> list[Path]:
     return roots
 
 
+def _file_size(path: Path) -> int:
+    try:
+        return path.stat().st_size
+    except OSError:
+        return 0
+
+
 def find_midi_files(source: Path | str) -> list[Path]:
     """
     Recursively find .mid / .midi files under source.
@@ -100,7 +114,6 @@ def find_midi_files_with_roots(
         nonlocal last_report
         if not progress:
             return
-        # Throttle UI updates (always emit the first one)
         if last_report != 0 and walked - last_report < 200:
             return
         last_report = walked
@@ -136,7 +149,6 @@ def find_midi_files_with_roots(
             if should_cancel and should_cancel():
                 raise ScanCancelled()
 
-            # Prune dirs in-place
             kept: list[str] = []
             for name in dirnames:
                 if name.startswith("."):
@@ -191,3 +203,157 @@ def find_midi_files_with_roots(
 
     found.sort(key=lambda item: item[2].lower())
     return found
+
+
+def discover_with_checkpoint(
+    checkpoint: ScanCheckpoint,
+    *,
+    should_cancel: CancelCallback | None = None,
+    progress: ProgressCallback | None = None,
+    save_every: int = 100,
+) -> ScanCheckpoint:
+    """
+    Resumable discovery using an explicit directory stack + checkpoint file.
+
+    Mutates and periodically saves ``checkpoint``. Sets phase to ``classify``
+    when discovery finishes.
+    """
+    root = Path(checkpoint.root)
+    completed = set(checkpoint.completed_dirs)
+    pending = list(checkpoint.pending_dirs)
+    if not pending and checkpoint.phase == "discover":
+        pending = [str(root)]
+        checkpoint.pending_dirs = pending
+
+    found_paths = {e.path for e in checkpoint.found}
+    dirs_since_save = 0
+    batch_completed: list[str] = []
+    last_report_walked = checkpoint.walked
+
+    def report(detail: str) -> None:
+        nonlocal last_report_walked
+        if not progress:
+            return
+        if (
+            last_report_walked != 0
+            and checkpoint.walked - last_report_walked < 200
+            and dirs_since_save != 0
+        ):
+            return
+        last_report_walked = checkpoint.walked
+        progress(
+            ProgressUpdate(
+                phase="discover",
+                message=(
+                    f"Discovering… walked {checkpoint.walked:,} paths, "
+                    f"found {len(checkpoint.found):,} MIDI "
+                    f"(pending dirs {len(pending):,})"
+                ),
+                current=checkpoint.walked,
+                total=0,
+                detail=detail,
+            )
+        )
+
+    while pending:
+        if should_cancel and should_cancel():
+            checkpoint.pending_dirs = pending
+            save_checkpoint(checkpoint, new_completed=batch_completed)
+            raise ScanCancelled()
+
+        dirpath = pending.pop()
+        if dirpath in completed:
+            continue
+
+        try:
+            with os.scandir(dirpath) as it:
+                entries = list(it)
+        except OSError:
+            completed.add(dirpath)
+            batch_completed.append(dirpath)
+            continue
+
+        child_dirs: list[str] = []
+        file_count = 0
+        for entry in entries:
+            try:
+                name = entry.name
+                if entry.is_symlink():
+                    continue
+                if entry.is_dir(follow_symlinks=False):
+                    if name.startswith(".") or name in _SKIP_DIR_NAMES:
+                        continue
+                    child = str(Path(dirpath) / name)
+                    if child not in completed:
+                        child_dirs.append(child)
+                elif entry.is_file(follow_symlinks=False):
+                    file_count += 1
+                    suffix = Path(name).suffix.lower()
+                    if suffix not in MIDI_SUFFIXES:
+                        continue
+                    path = Path(dirpath) / name
+                    try:
+                        path_s = str(path.resolve())
+                    except OSError:
+                        path_s = str(path)
+                    if path_s in found_paths:
+                        continue
+                    try:
+                        rel = str(path.relative_to(root))
+                    except ValueError:
+                        rel = name
+                    try:
+                        size = entry.stat(follow_symlinks=False).st_size
+                    except OSError:
+                        size = _file_size(path)
+                    checkpoint.found.append(
+                        FoundEntry(
+                            path=path_s,
+                            relative=rel,
+                            root=str(root),
+                            size_bytes=size,
+                        )
+                    )
+                    found_paths.add(path_s)
+            except OSError:
+                continue
+
+        pending.extend(reversed(child_dirs))
+        completed.add(dirpath)
+        batch_completed.append(dirpath)
+        checkpoint.walked += 1 + file_count
+        dirs_since_save += 1
+        report(dirpath)
+
+        if dirs_since_save >= save_every:
+            checkpoint.pending_dirs = pending
+            save_checkpoint(checkpoint, new_completed=batch_completed)
+            batch_completed = []
+            dirs_since_save = 0
+
+    checkpoint.pending_dirs = []
+    checkpoint.phase = "classify"
+    checkpoint.found.sort(key=lambda e: e.relative.lower())
+    save_checkpoint(checkpoint, new_completed=batch_completed)
+
+    if progress:
+        progress(
+            ProgressUpdate(
+                phase="discover",
+                message=(
+                    f"Discovery done — {len(checkpoint.found):,} MIDI "
+                    f"in {checkpoint.walked:,} paths"
+                ),
+                current=checkpoint.walked,
+                total=0,
+                detail="",
+            )
+        )
+    return checkpoint
+
+
+def start_full_computer_checkpoint(root: str | Path = "/") -> ScanCheckpoint:
+    """Create a fresh whole-computer scan checkpoint."""
+    cp = new_checkpoint(root)
+    save_checkpoint(cp)
+    return cp

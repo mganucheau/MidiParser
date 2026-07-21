@@ -12,10 +12,16 @@ from typing import Literal
 from midi_parser import CATEGORIES
 from midi_parser.assess import assess_file
 from midi_parser.name_hints import category_from_name
+from midi_parser.checkpoint import (
+    ClassifiedEntry,
+    ScanCheckpoint,
+    save_checkpoint,
+)
 from midi_parser.scan import (
     ProgressCallback,
     ProgressUpdate,
     ScanCancelled,
+    discover_with_checkpoint,
     find_midi_files_with_roots,
 )
 
@@ -34,6 +40,7 @@ class FileResult:
     content_hash: str | None = None
     is_duplicate: bool = False
     duplicate_of: str | None = None  # relative path of the kept original
+    size_bytes: int = 0
 
 
 def file_content_hash(path: Path | str) -> str:
@@ -45,11 +52,19 @@ def file_content_hash(path: Path | str) -> str:
     return h.hexdigest()
 
 
+def _file_size(path: Path) -> int:
+    try:
+        return path.stat().st_size
+    except OSError:
+        return 0
+
+
 def classify_file(
     path: Path,
     *,
     relative: str | None = None,
     source_root: Path | None = None,
+    size_bytes: int | None = None,
 ) -> FileResult:
     """Classify one MIDI file using name hints then content assessment."""
     if relative is None:
@@ -60,6 +75,8 @@ def classify_file(
                 relative = path.name
         else:
             relative = path.name
+
+    size = size_bytes if size_bytes is not None else _file_size(path)
 
     try:
         digest = file_content_hash(path)
@@ -75,6 +92,7 @@ def classify_file(
             category=hint,
             reason="name",
             content_hash=digest,
+            size_bytes=size,
         )
 
     category = assess_file(path)
@@ -86,6 +104,7 @@ def classify_file(
         category=category,
         reason=reason,
         content_hash=digest,
+        size_bytes=size,
     )
 
 
@@ -156,6 +175,93 @@ def classify_all(
     return results
 
 
+def _results_from_classified(entries: list[ClassifiedEntry]) -> list[FileResult]:
+    return [
+        FileResult(
+            source=Path(e.source),
+            relative=e.relative,
+            filename=e.filename,
+            category=e.category,
+            reason=e.reason,
+            content_hash=e.content_hash,
+            size_bytes=e.size_bytes,
+        )
+        for e in entries
+    ]
+
+
+def classify_with_checkpoint(
+    checkpoint: ScanCheckpoint,
+    progress: ProgressCallback | None = None,
+    *,
+    remove_duplicates: bool = False,
+    should_cancel: CancelCallback | None = None,
+    save_every: int = 25,
+) -> list[FileResult]:
+    """
+    Full-computer scan: resume discovery then classify, checkpointing as it goes.
+    """
+    if checkpoint.phase == "discover":
+        discover_with_checkpoint(
+            checkpoint,
+            should_cancel=should_cancel,
+            progress=progress,
+        )
+
+    done_paths = {e.source for e in checkpoint.classified}
+    results = _results_from_classified(checkpoint.classified)
+    pending = [e for e in checkpoint.found if e.path not in done_paths]
+    total = len(checkpoint.found)
+    done = len(results)
+    since_save = 0
+
+    for entry in pending:
+        if should_cancel and should_cancel():
+            save_checkpoint(checkpoint)
+            raise ScanCancelled()
+
+        done += 1
+        path = Path(entry.path)
+        if progress:
+            progress(
+                ProgressUpdate(
+                    phase="classify",
+                    message=f"Classifying {done:,} / {total:,}",
+                    current=done,
+                    total=max(total, 1),
+                    detail=entry.path,
+                )
+            )
+        result = classify_file(
+            path,
+            relative=entry.relative,
+            size_bytes=entry.size_bytes,
+        )
+        results.append(result)
+        checkpoint.classified.append(
+            ClassifiedEntry(
+                source=str(result.source),
+                relative=result.relative,
+                filename=result.filename,
+                category=result.category,
+                reason=result.reason,
+                content_hash=result.content_hash,
+                size_bytes=result.size_bytes,
+            )
+        )
+        since_save += 1
+        if since_save >= save_every:
+            save_checkpoint(checkpoint)
+            since_save = 0
+
+    checkpoint.phase = "done"
+    save_checkpoint(checkpoint)
+
+    if remove_duplicates:
+        mark_duplicates(results)
+    return results
+
+
 def count_by_category(
     results: list[FileResult],
     *,
@@ -172,6 +278,19 @@ def count_by_category(
 
 def duplicate_count(results: list[FileResult]) -> int:
     return sum(1 for r in results if r.is_duplicate)
+
+
+def total_size_bytes(
+    results: list[FileResult],
+    *,
+    exclude_duplicates: bool = False,
+) -> int:
+    total = 0
+    for r in results:
+        if exclude_duplicates and r.is_duplicate:
+            continue
+        total += r.size_bytes
+    return total
 
 
 def _unique_dest(folder: Path, filename: str) -> Path:
