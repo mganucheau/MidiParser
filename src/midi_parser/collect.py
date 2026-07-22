@@ -8,6 +8,7 @@ import shutil
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 from midi_parser.scan import (
     MIDI_SUFFIXES,
@@ -19,6 +20,8 @@ from midi_parser.scan import (
     _normalize_roots,
 )
 from midi_parser.util import format_size
+
+TransferMode = Literal["copy", "move"]
 
 # Extra headroom beyond the file size before treating disk as "enough space"
 _SPACE_MARGIN = 64 * 1024
@@ -156,24 +159,28 @@ def _wait_for_space(
             slept += 0.25
 
 
-def _copy_with_space_retry(
+def _transfer_with_space_retry(
     src: Path,
     dest_root: Path,
     filename: str,
     *,
+    mode: TransferMode,
     stats: CollectStats,
     progress: ProgressCallback | None,
     should_cancel: CancelCallback | None,
     poll_seconds: float,
 ) -> bool:
-    """Copy ``src`` into ``dest_root``; pause/retry on disk full."""
+    """Copy or move ``src`` into ``dest_root``; pause/retry on disk full."""
     needed = _file_size(src) + _SPACE_MARGIN
     while True:
         if should_cancel and should_cancel():
             raise ScanCancelled()
         target = _unique_dest(dest_root, filename)
         try:
-            shutil.copy2(src, target)
+            if mode == "move":
+                shutil.move(str(src), str(target))
+            else:
+                shutil.copy2(src, target)
             return True
         except OSError as exc:
             _cleanup_partial(target)
@@ -220,15 +227,16 @@ def collect_midi(
     roots: Path | str | list[Path | str],
     dest: Path | str,
     *,
+    mode: TransferMode = "copy",
     progress: ProgressCallback | None = None,
     should_cancel: CancelCallback | None = None,
     space_poll_seconds: float = 2.0,
     skip_volumes: bool = True,
 ) -> CollectStats:
     """
-    Walk roots for ``.mid`` / ``.midi`` by extension and copy into ``dest``.
+    Walk roots for ``.mid`` / ``.midi`` by extension and copy/move into ``dest``.
 
-    No classification, no content hashing — extension match + copy only.
+    No classification, no content hashing — extension match + transfer only.
     Collision-safe names. Skips ``/Volumes`` (and other noisy root dirs) by
     default. Does not walk into ``dest``.
 
@@ -244,6 +252,8 @@ def collect_midi(
     stats = CollectStats()
     last_report = 0
     dest_prefix = str(dest_root) + os.sep
+    verb = "Moving" if mode == "move" else "Copying"
+    done_verb = "moved" if mode == "move" else "copied"
 
     def report(detail: str) -> None:
         nonlocal last_report
@@ -256,8 +266,8 @@ def collect_midi(
             ProgressUpdate(
                 phase="collect",
                 message=(
-                    f"Collecting… walked {stats.walked:,} paths, "
-                    f"found {stats.found:,}, copied {stats.copied:,}"
+                    f"{verb}… walked {stats.walked:,} paths, "
+                    f"found {stats.found:,}, {done_verb} {stats.copied:,}"
                 ),
                 current=stats.walked,
                 total=0,
@@ -270,7 +280,7 @@ def collect_midi(
             progress(
                 ProgressUpdate(
                     phase="collect",
-                    message=f"Collecting under {root}…",
+                    message=f"{verb} under {root}…",
                     detail=str(root),
                 )
             )
@@ -328,10 +338,11 @@ def collect_midi(
                     continue
 
                 stats.found += 1
-                ok = _copy_with_space_retry(
+                ok = _transfer_with_space_retry(
                     path,
                     dest_root,
                     name,
+                    mode=mode,
                     stats=stats,
                     progress=progress,
                     should_cancel=should_cancel,
@@ -347,8 +358,8 @@ def collect_midi(
                         ProgressUpdate(
                             phase="collect",
                             message=(
-                                f"Collecting… walked {stats.walked:,} paths, "
-                                f"found {stats.found:,}, copied {stats.copied:,}"
+                                f"{verb}… walked {stats.walked:,} paths, "
+                                f"found {stats.found:,}, {done_verb} {stats.copied:,}"
                             ),
                             current=stats.walked,
                             total=0,
@@ -361,11 +372,11 @@ def collect_midi(
             ProgressUpdate(
                 phase="collect",
                 message=(
-                    f"Collect done — copied {stats.copied:,} of {stats.found:,} MIDI "
+                    f"Done — {done_verb} {stats.copied:,} of {stats.found:,} MIDI "
                     f"(errors {stats.errors:,})"
                 ),
                 current=stats.walked,
-                total=0,
+                total=max(stats.walked, 1),
                 detail=str(dest_root),
             )
         )

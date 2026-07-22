@@ -17,8 +17,12 @@ def plan_phases(
     """
     Return ordered (phase, weight) pairs that sum to 1.0 for the whole task.
 
-    discover / classify / hash_dest / transfer cover Scan → Copy/Move/Parse/All.
+    Copy/Move are fast collect (extension only). Scan / Parse / All classify.
     """
+    if job in {"Copy", "Move"}:
+        # Extension walk + transfer — no classify phase.
+        return [("collect", 1.0)]
+
     if job == "Scan":
         return [("discover", 0.35), ("classify", 0.65)]
 
@@ -27,7 +31,7 @@ def plan_phases(
             return [("hash_dest", 0.12), ("transfer", 0.88)]
         return [("transfer", 1.0)]
 
-    # Full pipeline: discover + classify (+ optional dest hash) + transfer
+    # Parse / All full pipeline
     if remove_duplicates:
         return [
             ("discover", 0.18),
@@ -52,8 +56,11 @@ def phase_fraction(current: int, total: int) -> float:
     return min(0.97, 1.0 - math.exp(-current / 6000.0))
 
 
-def normalize_phase(phase: str) -> str:
-    if phase in {"collect", "collect_paused"}:
+def normalize_phase(phase: str, phases: PhasePlan | None = None) -> str:
+    names = {name for name, _ in (phases or [])}
+    if phase == "collect_paused":
+        return "collect" if "collect" in names else "transfer"
+    if phase == "collect" and "collect" not in names and "transfer" in names:
         return "transfer"
     return phase
 
@@ -70,7 +77,7 @@ def overall_progress(
     if not phases:
         return max(floor, phase_fraction(current, total))
 
-    phase = normalize_phase(phase)
+    phase = normalize_phase(phase, phases)
     names = [name for name, _ in phases]
     if phase not in names:
         # Unknown / skipped phase — keep floor (monotonic caller handles this).

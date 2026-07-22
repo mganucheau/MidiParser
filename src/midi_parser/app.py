@@ -12,6 +12,7 @@ from tkinter import filedialog, messagebox, ttk
 import customtkinter as ctk
 
 from midi_parser import CATEGORIES
+from midi_parser.collect import CollectStats, collect_midi
 from midi_parser.icons import IconButton, MiniSwitch, section_label_text
 from midi_parser.job_checkpoint import (
     JobCheckpoint,
@@ -64,7 +65,10 @@ from midi_parser.util import format_duration, format_size
 log = logging.getLogger(__name__)
 
 JOB_MODES = ("Scan", "Copy", "Move", "Parse", "All")
-TRANSFER_JOBS = frozenset({"Copy", "Move", "Parse", "All"})
+# Fast: extension-only flat dump (no classify). Slow: category organize.
+FAST_JOBS = frozenset({"Copy", "Move"})
+ORGANIZE_JOBS = frozenset({"Parse", "All"})
+TRANSFER_JOBS = FAST_JOBS | ORGANIZE_JOBS
 # Treeview dies / freezes on huge inserts — show a capped preview.
 MAX_TABLE_ROWS = 2_500
 PROGRESS_UI_MIN_INTERVAL = 0.08  # seconds between coalesced UI paints
@@ -1019,14 +1023,20 @@ class MidiOrganizerApp(ctk.CTk):
         self._dest = cp.dest
         self.dedupe_var.set(cp.remove_duplicates)
         self.job_var.set(cp.job)
+        self._refresh_path_lists()
+        self._save_session()
+        # Old Copy/Move checkpoints classified first — drop them and run fast collect.
+        if cp.job in FAST_JOBS:
+            clear_job_checkpoint()
+            self._refresh_resume_button()
+            if cp.job == "Move" and not self._confirm_move():
+                return
+            self._run_fast_collect(cp.job)
+            return
         results = [file_result_from_dict(d) for d in cp.results]
         self._results = results
         self._fill_table(results)
-        self._refresh_path_lists()
-        self._save_session()
-        if cp.job == "Move" and not self._confirm_move():
-            return
-        self._run_transfer_job(
+        self._run_organize_job(
             cp.job,
             prior=results,
             skip_sources=list(cp.transferred),
@@ -1065,10 +1075,9 @@ class MidiOrganizerApp(ctk.CTk):
         return bool(
             messagebox.askyesno(
                 "Confirm Move",
-                "Move all MIDI files out of the source folders into the "
-                "destination?\n\n"
-                "This relocates the originals — they will no longer be in "
-                "the source folders. Prefer Copy if you want to keep them.",
+                "Move all .mid / .midi files into the destination folder "
+                "(flat dump, no classifying)?\n\n"
+                "Originals leave the source folders. Prefer Copy to keep them.",
                 icon="warning",
                 default="no",
             )
@@ -1080,13 +1089,66 @@ class MidiOrganizerApp(ctk.CTk):
         mode = self.job_var.get()
         if mode == "Scan":
             self._run_scan()
-        elif mode in TRANSFER_JOBS:
+        elif mode in FAST_JOBS:
             if mode == "Move" and not self._confirm_move():
                 return
             clear_job_checkpoint()
-            self._run_transfer_job(mode)
+            self._run_fast_collect(mode)
+        elif mode in ORGANIZE_JOBS:
+            clear_job_checkpoint()
+            self._run_organize_job(mode)
         else:
             self._run_scan()
+
+    def _run_fast_collect(self, job: str) -> None:
+        """Copy/Move: walk by extension only — no classify / hashing."""
+        if not self._require_sources() or not self._require_dest():
+            return
+        assert self._dest is not None
+        mode = self._transfer_mode_for(job)
+        verb = "Moving" if mode == "move" else "Copying"
+        self._begin_job(f"{verb} MIDI (fast)…", job, reuse_scan=False)
+        sources = list(self._sources)
+        dest = self._dest
+
+        def work() -> None:
+            try:
+                stats = collect_midi(
+                    sources,
+                    dest,
+                    mode=mode,  # type: ignore[arg-type]
+                    progress=self._update_progress,
+                    should_cancel=self._cancel_event.is_set,
+                    skip_volumes=True,
+                )
+            except ScanCancelled:
+                self.after(0, lambda: self._job_done(cancelled=True))
+                return
+            except Exception as exc:  # noqa: BLE001
+                err = str(exc)
+                self.after(0, lambda e=err: self._job_done(error=e))
+                return
+            self.after(0, lambda s=stats: self._fast_collect_finished(s, job, dest))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _fast_collect_finished(
+        self, stats: CollectStats, job: str, dest: str
+    ) -> None:
+        self._clear_active_checkpoint()
+        self._set_busy(False)
+        self._cancel_event.clear()
+        self._active_job = None
+        elapsed = self.timer_var.get()
+        self._overall_ratio = 1.0
+        self.progress.set(1)
+        self.progress_pct.set("100%")
+        self.detail_var.set(dest)
+        done = "moved" if job == "Move" else "copied"
+        self.status_var.set(
+            f"{job} complete — {done} {stats.copied:,} of {stats.found:,} "
+            f"(errors {stats.errors:,})  ({elapsed})"
+        )
 
     def _run_scan(self) -> None:
         if not self._require_sources():
@@ -1114,7 +1176,7 @@ class MidiOrganizerApp(ctk.CTk):
 
         threading.Thread(target=work, daemon=True).start()
 
-    def _run_transfer_job(
+    def _run_organize_job(
         self,
         job: str,
         *,

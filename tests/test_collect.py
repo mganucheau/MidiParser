@@ -34,6 +34,19 @@ def test_collect_copies_flat_and_skips_non_midi(tmp_path: Path) -> None:
     assert not (dest / "readme.txt").exists()
 
 
+def test_collect_move_relocates_files(tmp_path: Path) -> None:
+    src = tmp_path / "library"
+    dest = tmp_path / "dump"
+    path = src / "a" / "kick.mid"
+    _write_midi(path, b"kick")
+
+    stats = collect_midi(src, dest, mode="move")
+
+    assert stats.copied == 1
+    assert (dest / "kick.mid").read_bytes() == b"kick"
+    assert not path.exists()
+
+
 def test_collect_collision_safe_names(tmp_path: Path) -> None:
     src = tmp_path / "library"
     dest = tmp_path / "dump"
