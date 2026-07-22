@@ -44,10 +44,16 @@ def test_job_checkpoint_roundtrip(tmp_path: Path, monkeypatch) -> None:
     assert loaded.job == "Move"
     assert loaded.transfer_mode == "move"
     assert len(loaded.results) == 1
+    assert loaded.is_resumable()
     restored = file_result_from_dict(loaded.results[0])
     assert restored.filename == "a.mid"
     assert restored.category == "Drums"
     assert file_result_to_dict(restored)["source"] == "/src/a.mid"
+
+    # Fully transferred → not resumable
+    loaded.transferred = ["/src/a.mid"]
+    save_job_checkpoint(loaded, path)
+    assert load_job_checkpoint(path) is None
 
     clear_job_checkpoint(path)
     assert load_job_checkpoint(path) is None

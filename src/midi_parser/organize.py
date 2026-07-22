@@ -159,7 +159,8 @@ def classify_all(
     for i, (path, _root, relative) in enumerate(entries, start=1):
         if should_cancel and should_cancel():
             raise ScanCancelled()
-        if progress:
+        # Throttle UI progress — every file floods Tk and can freeze/crash.
+        if progress and (i == 1 or i == total or i % 25 == 0):
             progress(
                 ProgressUpdate(
                     phase="classify",
@@ -449,9 +450,16 @@ def organize(
         if should_cancel and should_cancel():
             raise ScanCancelled()
 
-        src_key = str(result.source.resolve()) if result.source.exists() else str(result.source)
+        try:
+            src_key = (
+                str(result.source.resolve())
+                if result.source.exists()
+                else str(result.source)
+            )
+        except OSError:
+            src_key = str(result.source)
         if src_key in already or str(result.source) in already:
-            if progress:
+            if progress and (i == 1 or i == total or i % 25 == 0):
                 progress(
                     ProgressUpdate(
                         phase="transfer",
@@ -465,7 +473,7 @@ def organize(
 
         if remove_duplicates and result.is_duplicate:
             result.dest = None
-            if progress:
+            if progress and (i == 1 or i == total or i % 25 == 0):
                 progress(
                     ProgressUpdate(
                         phase="transfer",
@@ -505,7 +513,7 @@ def organize(
             already.add(src_key)
             if on_transferred is not None:
                 on_transferred(result)
-        if progress:
+        if progress and (i == 1 or i == total or i % 10 == 0):
             verb = "Moving" if mode == "move" else "Copying"
             if dry_run:
                 verb = "Dry run"

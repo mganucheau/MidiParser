@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import threading
 import time
 import tkinter as tk
@@ -32,7 +33,9 @@ from midi_parser.organize import (
     organize,
     total_size_bytes,
 )
+from midi_parser.progress import PhasePlan, overall_progress, plan_phases
 from midi_parser.scan import ProgressUpdate
+from midi_parser.session import SessionState, load_session, save_session
 from midi_parser.theme import (
     BODY_PAD_T,
     COUNTS_W,
@@ -58,8 +61,13 @@ from midi_parser.theme import (
 )
 from midi_parser.util import format_duration, format_size
 
+log = logging.getLogger(__name__)
+
 JOB_MODES = ("Scan", "Copy", "Move", "Parse", "All")
 TRANSFER_JOBS = frozenset({"Copy", "Move", "Parse", "All"})
+# Treeview dies / freezes on huge inserts — show a capped preview.
+MAX_TABLE_ROWS = 2_500
+PROGRESS_UI_MIN_INTERVAL = 0.08  # seconds between coalesced UI paints
 
 
 class MidiOrganizerApp(ctk.CTk):
@@ -87,13 +95,20 @@ class MidiOrganizerApp(ctk.CTk):
         self._active_job: str | None = None
         self._job_cp: JobCheckpoint | None = None
         self._transferred: list[str] = []
-        self._transfer_save_every = 10
+        self._transfer_save_every = 50
         self._progress_current = 0
         self._progress_total = 0
+        self._overall_ratio = 0.0
+        self._job_phases: PhasePlan = []
         self._pending_resume: JobCheckpoint | None = None
+        self._progress_lock = threading.Lock()
+        self._latest_progress: ProgressUpdate | None = None
+        self._progress_flush_scheduled = False
+        self._last_progress_paint = 0.0
 
         self._build()
         self._style_tree()
+        self._restore_session()
         self._refresh_path_lists()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self._refresh_resume_button()
@@ -226,6 +241,7 @@ class MidiOrganizerApp(ctk.CTk):
             side,
             values=list(JOB_MODES),
             variable=self.job_var,
+            command=self._on_job_changed,
             height=30,
             font=font(12),
             dropdown_font=font(12),
@@ -609,6 +625,61 @@ class MidiOrganizerApp(ctk.CTk):
     def _folder_label(self, path: str) -> str:
         return Path(path).name or path
 
+    def _session_state(self) -> SessionState:
+        return SessionState(
+            sources=list(self._sources),
+            dest=self._dest,
+            job=self.job_var.get() if hasattr(self, "job_var") else "Scan",
+            remove_duplicates=(
+                bool(self.dedupe_var.get()) if hasattr(self, "dedupe_var") else False
+            ),
+        )
+
+    def _save_session(self) -> None:
+        try:
+            save_session(self._session_state())
+        except OSError:
+            log.exception("Failed to save session")
+
+    def _restore_session(self) -> None:
+        """Reload sources/destination/prefs; prefer session, fall back to job checkpoint."""
+        state = load_session()
+        cp = load_job_checkpoint()
+
+        sources = list(state.sources) or (list(cp.sources) if cp else [])
+        dest = state.dest or (cp.dest if cp else None)
+        job = state.job
+        if job not in JOB_MODES:
+            job = cp.job if cp and cp.job in JOB_MODES else "Scan"
+        dedupe = state.remove_duplicates
+        if cp is not None:
+            # Interrupted job owns task prefs so Resume matches what was running.
+            if cp.job in JOB_MODES:
+                job = cp.job
+            dedupe = cp.remove_duplicates
+            if not sources:
+                sources = list(cp.sources)
+            if not dest:
+                dest = cp.dest
+
+        self._sources = sources
+        self._dest = dest
+        self.job_var.set(job)
+        self.dedupe_var.set(dedupe)
+
+        if cp is not None and cp.results:
+            try:
+                self._results = [file_result_from_dict(d) for d in cp.results]
+                self._fill_table(self._results)
+            except Exception:
+                log.exception("Failed to restore interrupted results")
+
+        self._save_session()
+
+    def _on_job_changed(self, _value: str | None = None) -> None:
+        if not self._busy:
+            self._save_session()
+
     def _add_source(self) -> None:
         if self._busy:
             return
@@ -620,6 +691,7 @@ class MidiOrganizerApp(ctk.CTk):
             self._sources.append(resolved)
             self._results = []
             self._refresh_path_lists()
+            self._save_session()
             self.status_var.set(f"Added {self._folder_label(resolved)}")
             self.detail_var.set(resolved)
 
@@ -629,6 +701,7 @@ class MidiOrganizerApp(ctk.CTk):
         removed = self._sources.pop(index)
         self._results = []
         self._refresh_path_lists()
+        self._save_session()
         self.status_var.set(f"Removed {self._folder_label(removed)}")
         self.detail_var.set("")
 
@@ -640,6 +713,7 @@ class MidiOrganizerApp(ctk.CTk):
             return
         self._dest = str(Path(path).expanduser().resolve())
         self._refresh_path_lists()
+        self._save_session()
         self.status_var.set(f"Destination: {self._folder_label(self._dest)}")
         self.detail_var.set(self._dest)
 
@@ -648,6 +722,7 @@ class MidiOrganizerApp(ctk.CTk):
             return
         self._dest = None
         self._refresh_path_lists()
+        self._save_session()
         self.status_var.set("Destination cleared.")
         self.detail_var.set("")
 
@@ -676,25 +751,22 @@ class MidiOrganizerApp(ctk.CTk):
         self._timer_start = None
 
     def _eta_text(self) -> str:
-        if self._timer_start is None or self._progress_total <= 0:
-            return ""
-        ratio = min(1.0, self._progress_current / self._progress_total)
-        if ratio < 0.02:
+        ratio = self._overall_ratio
+        if self._timer_start is None or ratio < 0.02:
             return ""
         elapsed = time.monotonic() - self._timer_start
-        if elapsed < 0.5:
+        if elapsed < 0.75:
             return ""
         remaining = elapsed * (1.0 - ratio) / ratio
         return f"~{format_duration(remaining)} left"
 
     def _update_eta_label(self) -> None:
-        if self._progress_total and self._progress_total > 0:
-            ratio = min(1.0, self._progress_current / self._progress_total)
-            pct = f"{int(ratio * 100)}%"
-            eta = self._eta_text()
-            self.progress_pct.set(f"{pct} · {eta}" if eta else pct)
-        elif self._busy:
-            self.progress_pct.set("…")
+        if not self._busy and self._overall_ratio <= 0:
+            self.progress_pct.set("")
+            return
+        pct = f"{int(self._overall_ratio * 100)}%"
+        eta = self._eta_text()
+        self.progress_pct.set(f"{pct} · {eta}" if eta else pct)
 
     def _set_busy(self, busy: bool) -> None:
         self._busy = busy
@@ -717,6 +789,7 @@ class MidiOrganizerApp(ctk.CTk):
         self.stop_btn.configure(state="disabled")
 
     def _on_close(self) -> None:
+        self._save_session()
         if self._busy:
             self._cancel_event.set()
             self._persist_job_checkpoint()
@@ -726,65 +799,119 @@ class MidiOrganizerApp(ctk.CTk):
         self.destroy()
 
     def _update_progress(self, update: ProgressUpdate) -> None:
-        def ui() -> None:
-            if update.total and update.total > 0:
-                self._progress_current = update.current
-                self._progress_total = update.total
-                ratio = min(1.0, update.current / update.total)
-                self.progress.set(ratio)
-                self._update_eta_label()
-            else:
-                self._progress_current = 0
-                self._progress_total = 0
-                self._discover_pulse = 0.08 + ((self._discover_pulse + 0.04) % 0.55)
-                self.progress.set(self._discover_pulse)
-                self.progress_pct.set("…")
-            self.status_var.set(update.message)
-            detail = update.detail
+        """Coalesce worker progress onto the UI thread (avoids Tk queue blow-up)."""
+        with self._progress_lock:
+            self._latest_progress = update
+            if self._progress_flush_scheduled:
+                return
+            self._progress_flush_scheduled = True
+        self.after(0, self._flush_progress)
+
+    def _flush_progress(self) -> None:
+        with self._progress_lock:
+            latest = self._latest_progress
+            self._progress_flush_scheduled = False
+        if latest is None:
+            return
+        now = time.monotonic()
+        wait = PROGRESS_UI_MIN_INTERVAL - (now - self._last_progress_paint)
+        if wait > 0:
+            with self._progress_lock:
+                if not self._progress_flush_scheduled:
+                    self._progress_flush_scheduled = True
+                    self.after(int(wait * 1000) + 1, self._flush_progress)
+            return
+
+        self._last_progress_paint = now
+        try:
+            self._progress_current = latest.current
+            self._progress_total = latest.total
+            ratio = overall_progress(
+                self._job_phases,
+                latest.phase,
+                latest.current,
+                latest.total,
+                floor=self._overall_ratio,
+            )
+            # Keep the bar monotonic for the whole task (Scan → transfer).
+            self._overall_ratio = max(self._overall_ratio, ratio)
+            self.progress.set(self._overall_ratio)
+            self._update_eta_label()
+            self.status_var.set(latest.message)
+            detail = latest.detail
             if len(detail) > 140:
                 detail = "…" + detail[-139:]
             self.detail_var.set(detail)
+        except tk.TclError:
+            log.exception("Progress UI update failed")
 
-        self.after(0, ui)
+        with self._progress_lock:
+            if self._latest_progress is not latest and not self._progress_flush_scheduled:
+                self._progress_flush_scheduled = True
+                self.after(0, self._flush_progress)
 
-    def _begin_job(self, status: str, job: str) -> None:
+    def _begin_job(
+        self,
+        status: str,
+        job: str,
+        *,
+        reuse_scan: bool = False,
+        resume_done: int = 0,
+        resume_total: int = 0,
+    ) -> None:
         self._cancel_event.clear()
         self._active_job = job
         self._progress_current = 0
         self._progress_total = 0
+        self._job_phases = plan_phases(
+            job,
+            reuse_scan=reuse_scan,
+            remove_duplicates=self.dedupe_var.get(),
+        )
+        if resume_total > 0 and resume_done > 0:
+            self._overall_ratio = min(0.99, resume_done / resume_total)
+        else:
+            self._overall_ratio = 0.0
         self._set_busy(True)
         self._discover_pulse = 0.08
         self.status_var.set(status)
         self.detail_var.set("")
-        self.progress.set(0)
-        self.progress_pct.set("0%")
+        self.progress.set(self._overall_ratio)
+        self._update_eta_label()
 
     def _fill_table(self, results: list[FileResult]) -> None:
         exclude = self.dedupe_var.get()
         self.tree.delete(*self.tree.get_children())
         p = self.pal
-        for i, r in enumerate(results):
-            tag = "alt" if i % 2 else "base"
-            self.tree.insert(
-                "",
-                "end",
-                values=(
-                    r.filename,
-                    r.category,
-                    format_size(r.size_bytes),
-                    r.relative,
-                ),
-                tags=(tag, r.category),
-            )
-        self.tree.tag_configure("base", background=p.panel)
-        self.tree.tag_configure("alt", background=p.rowalt)
-        for cat, color in KIND_COLORS.items():
-            self.tree.tag_configure(cat, foreground=color)
+        display = [r for r in results if not (exclude and r.is_duplicate)]
+        capped = display[:MAX_TABLE_ROWS]
+        try:
+            for i, r in enumerate(capped):
+                tag = "alt" if i % 2 else "base"
+                self.tree.insert(
+                    "",
+                    "end",
+                    values=(
+                        r.filename,
+                        r.category,
+                        format_size(r.size_bytes),
+                        r.relative,
+                    ),
+                    tags=(tag, r.category),
+                )
+            self.tree.tag_configure("base", background=p.panel)
+            self.tree.tag_configure("alt", background=p.rowalt)
+            for cat, color in KIND_COLORS.items():
+                self.tree.tag_configure(cat, foreground=color)
+        except tk.TclError:
+            log.exception("Results table update failed")
 
         counts = count_by_category(results, exclude_duplicates=exclude)
-        shown = [r for r in results if not (exclude and r.is_duplicate)]
         size = total_size_bytes(results, exclude_duplicates=exclude)
-        self.summary_var.set(f"{len(shown):,} files · {format_size(size)}")
+        summary = f"{len(display):,} files · {format_size(size)}"
+        if len(display) > MAX_TABLE_ROWS:
+            summary += f"  (showing first {MAX_TABLE_ROWS:,})"
+        self.summary_var.set(summary)
         for cat, lbl in self.count_labels.items():
             lbl.configure(text=str(counts.get(cat, 0)))
         self.total_label.configure(text=str(sum(counts.values())))
@@ -792,6 +919,7 @@ class MidiOrganizerApp(ctk.CTk):
         self.dup_label.configure(text=str(duplicate_count(results) if exclude else 0))
 
     def _on_dedupe_toggle(self) -> None:
+        self._save_session()
         if not self._results or self._busy:
             return
         if self.dedupe_var.get():
@@ -840,17 +968,14 @@ class MidiOrganizerApp(ctk.CTk):
         self._transferred.append(key)
         if self._job_cp is None:
             return
+        # Only persist the transferred list frequently — rewriting full results
+        # every N files can balloon disk I/O and OOM on large libraries.
         self._job_cp.transferred = list(self._transferred)
-        if result.dest is not None:
-            for d in self._job_cp.results:
-                if d.get("source") == key:
-                    d["dest"] = str(result.dest)
-                    break
         if len(self._transferred) % self._transfer_save_every == 0:
             try:
                 save_job_checkpoint(self._job_cp)
             except OSError:
-                pass
+                log.exception("Failed to save job checkpoint")
 
     def _persist_job_checkpoint(self) -> None:
         if self._job_cp is None:
@@ -873,11 +998,13 @@ class MidiOrganizerApp(ctk.CTk):
         cp = load_job_checkpoint()
         self._pending_resume = cp
         if cp is not None and not self._busy:
+            self.resume_btn.configure(text="Resume", state="normal")
+            self.resume_btn.grid()
             done = len(cp.transferred)
             total = len(cp.results)
-            self.resume_btn.configure(text=f"Resume {cp.job} ({done:,}/{total:,})")
-            self.resume_btn.grid()
-            self.resume_btn.configure(state="normal")
+            self.status_var.set(
+                f"Interrupted {cp.job} — {done:,}/{total:,} done. Press Resume to continue."
+            )
         else:
             self.resume_btn.grid_remove()
 
@@ -896,6 +1023,7 @@ class MidiOrganizerApp(ctk.CTk):
         self._results = results
         self._fill_table(results)
         self._refresh_path_lists()
+        self._save_session()
         if cp.job == "Move" and not self._confirm_move():
             return
         self._run_transfer_job(
@@ -963,7 +1091,7 @@ class MidiOrganizerApp(ctk.CTk):
     def _run_scan(self) -> None:
         if not self._require_sources():
             return
-        self._begin_job("Scanning…", "Scan")
+        self._begin_job("Scanning…", "Scan", reuse_scan=False)
         sources = list(self._sources)
         remove_duplicates = self.dedupe_var.get()
 
@@ -1009,19 +1137,27 @@ class MidiOrganizerApp(ctk.CTk):
         else:
             results_arg = None
 
+        reuse_scan = results_arg is not None
         verb = "Moving" if transfer_mode == "move" else "Copying"
-        if results_arg is not None:
+        if reuse_scan:
             status = f"{verb} from scan…"
         else:
             status = f"Scanning then {verb.lower()}…"
         if resume_from is not None:
             status = f"Resuming {job}…"
 
-        self._begin_job(status, job)
+        skip = list(skip_sources or [])
+        resume_total = len(results_arg) if results_arg is not None else 0
+        self._begin_job(
+            status,
+            job,
+            reuse_scan=reuse_scan,
+            resume_done=len(skip),
+            resume_total=resume_total,
+        )
         sources = list(self._sources)
         dest = self._dest
         remove_duplicates = self.dedupe_var.get()
-        skip = list(skip_sources or [])
 
         if results_arg is not None:
             self._init_job_checkpoint(job, results_arg, transferred=skip)
@@ -1109,6 +1245,7 @@ class MidiOrganizerApp(ctk.CTk):
         elapsed = self.timer_var.get()
         self._results = results
         self._fill_table(results)
+        self._overall_ratio = 1.0
         self.progress.set(1)
         self.progress_pct.set("100%")
         self.detail_var.set("")
@@ -1141,6 +1278,7 @@ class MidiOrganizerApp(ctk.CTk):
         elapsed = self.timer_var.get()
         self._results = results
         self._fill_table(results)
+        self._overall_ratio = 1.0
         self.progress.set(1)
         self.progress_pct.set("100%")
         self.detail_var.set("")

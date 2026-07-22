@@ -34,9 +34,14 @@ class JobCheckpoint:
             return False
         if not self.sources or not self.dest or not self.results:
             return False
-        # Incomplete if some files still need transfer (transferred can be empty
-        # if cancelled right as transfer began).
-        return True
+        done = set(self.transferred)
+        pending = [
+            r
+            for r in self.results
+            if str(r.get("source", "")) not in done and not r.get("is_duplicate")
+        ]
+        # Incomplete transfer (including cancelled before first file).
+        return bool(pending)
 
 
 def job_checkpoint_dir() -> Path:
