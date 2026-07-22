@@ -1,4 +1,4 @@
-"""CustomTkinter desktop UI — Cupertino shell matching Midi Toolkit."""
+"""CustomTkinter desktop UI — Midi Toolkit Cupertino shell."""
 
 from __future__ import annotations
 
@@ -11,30 +11,46 @@ from tkinter import filedialog, messagebox, ttk
 import customtkinter as ctk
 
 from midi_parser import CATEGORIES
-from midi_parser.checkpoint import clear_checkpoint, load_checkpoint
-from midi_parser.collect import CollectStats, collect_midi
+from midi_parser.icons import IconButton, MiniSwitch, section_label_text
+from midi_parser.job_checkpoint import (
+    JobCheckpoint,
+    clear_job_checkpoint,
+    file_result_from_dict,
+    file_result_to_dict,
+    load_job_checkpoint,
+    new_job_checkpoint,
+    save_job_checkpoint,
+)
 from midi_parser.name_hints import category_from_name
 from midi_parser.organize import (
     FileResult,
     ScanCancelled,
     classify_all,
-    classify_with_checkpoint,
     count_by_category,
     duplicate_count,
     mark_duplicates,
     organize,
     total_size_bytes,
 )
-from midi_parser.scan import ProgressUpdate, start_full_computer_checkpoint
+from midi_parser.scan import ProgressUpdate
 from midi_parser.theme import (
-    BTN_H,
+    BODY_PAD_T,
     COUNTS_W,
+    DANGER,
+    HEADER_TO_ROWS,
+    ICON_COL,
     KIND_COLORS,
+    LIST_HEADER_H,
     LIST_ROW_H,
     PAD,
+    PAD_V,
+    PATH_ROW_H,
     RADIUS_CHIP,
-    RADIUS_CONTROL,
-    RADIUS_CORNER,
+    ROW_ICON_GAP,
+    ROW_PAD_X,
+    SECTION_GAP,
+    SIDEBAR_ROW_H,
+    SIDEBAR_SECTION_H,
     SIDEBAR_W,
     TOOLBAR_H,
     font,
@@ -42,13 +58,16 @@ from midi_parser.theme import (
 )
 from midi_parser.util import format_duration, format_size
 
+JOB_MODES = ("Scan", "Copy", "Move", "Parse", "All")
+TRANSFER_JOBS = frozenset({"Copy", "Move", "Parse", "All"})
+
 
 class MidiOrganizerApp(ctk.CTk):
     def __init__(self) -> None:
         super().__init__()
         self.title("MIDI Organizer")
-        self.geometry("1100x720")
-        self.minsize(920, 600)
+        self.geometry("1120x740")
+        self.minsize(900, 580)
 
         ctk.set_appearance_mode("system")
         ctk.set_default_color_theme("blue")
@@ -59,275 +78,251 @@ class MidiOrganizerApp(ctk.CTk):
         self._results: list[FileResult] = []
         self._busy = False
         self._sources: list[str] = []
+        self._dest: str | None = None
         self._cancel_event = threading.Event()
         self._discover_pulse = 0.05
         self._timer_start: float | None = None
         self._timer_job: str | None = None
-        self._using_checkpoint = False
+        self._counts_open = True
+        self._active_job: str | None = None
+        self._job_cp: JobCheckpoint | None = None
+        self._transferred: list[str] = []
+        self._transfer_save_every = 10
+        self._progress_current = 0
+        self._progress_total = 0
+        self._pending_resume: JobCheckpoint | None = None
 
         self._build()
         self._style_tree()
+        self._refresh_path_lists()
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
         self._refresh_resume_button()
 
     # ── Shell ────────────────────────────────────────────────────────────────
 
     def _build(self) -> None:
-        p = self.pal
         self.grid_columnconfigure(0, weight=1)
         self.grid_rowconfigure(1, weight=1)
-
         self._build_toolbar()
         self._build_body()
         self._build_status()
 
     def _build_toolbar(self) -> None:
+        """Chrome: title + counts sidebar toggle (elapsed lives in status)."""
         p = self.pal
-        bar = ctk.CTkFrame(
-            self,
-            fg_color=p.chrome,
-            height=TOOLBAR_H,
-            corner_radius=0,
-            border_width=0,
-        )
+        bar = ctk.CTkFrame(self, fg_color=p.chrome, height=TOOLBAR_H, corner_radius=0)
         bar.grid(row=0, column=0, sticky="ew")
         bar.grid_propagate(False)
-        bar.grid_columnconfigure(1, weight=1)
+        bar.grid_columnconfigure(0, weight=1)
+        bar.grid_rowconfigure(0, weight=1)
 
-        # Left: app name (Midi Toolkit style)
-        left = ctk.CTkFrame(bar, fg_color="transparent")
-        left.grid(row=0, column=0, sticky="w", padx=PAD, pady=10)
         ctk.CTkLabel(
-            left,
+            bar,
             text="MIDI Organizer",
             font=font(13, bold=True),
             text_color=p.tx2,
-        ).pack(side="left")
-        ctk.CTkLabel(
-            left,
-            text="  ·  Toolkit",
-            font=font(12),
-            text_color=p.tx3,
-        ).pack(side="left")
+            anchor="w",
+        ).grid(row=0, column=0, sticky="w", padx=PAD)
 
-        # Center actions
-        mid = ctk.CTkFrame(bar, fg_color="transparent")
-        mid.grid(row=0, column=1, sticky="n", pady=11)
-
-        self.scan_btn = self._primary_btn(mid, "Scan", self._on_scan, width=88)
-        self.scan_btn.pack(side="left", padx=(0, 6))
-        self.halt_btn = self._danger_btn(mid, "Halt", self._on_halt, width=72)
-        self.halt_btn.pack(side="left", padx=(0, 6))
-        self.halt_btn.configure(state="disabled")
-        self.org_btn = self._secondary_btn(mid, "Organize", self._on_organize, width=96)
-        self.org_btn.pack(side="left", padx=(0, 12))
-
-        self.mode_var = tk.StringVar(value="copy")
-        self.mode_seg = ctk.CTkSegmentedButton(
-            mid,
-            values=["Copy", "Move"],
-            command=self._on_mode_change,
-            height=BTN_H,
-            font=font(11, bold=True),
-            selected_color=p.acc,
-            selected_hover_color=p.acc_hover,
-            unselected_color=p.ctl,
-            unselected_hover_color=p.hover,
-            text_color=p.tx,
-            fg_color=p.ctl,
-            corner_radius=RADIUS_CHIP,
+        self.counts_toggle = IconButton(
+            bar,
+            icon="sidebar-right",
+            command=self._toggle_counts,
+            color=p.tx2,
+            hover=p.acc,
+            bg=p.chrome,
+            size=28,
+            glyph=16,
         )
-        self.mode_seg.set("Copy")
-        self.mode_seg.pack(side="left", padx=(0, 12))
+        self.counts_toggle.grid(row=0, column=1, sticky="e", padx=PAD)
 
-        self.dry_run_var = tk.BooleanVar(value=False)
-        ctk.CTkCheckBox(
-            mid,
-            text="Dry run",
-            variable=self.dry_run_var,
-            font=font(11),
-            text_color=p.tx2,
-            fg_color=p.acc,
-            hover_color=p.acc_hover,
-            border_color=p.ctlb,
-            checkmark_color=p.accent_ink,
-            corner_radius=RADIUS_CONTROL,
-            width=20,
-            height=20,
-        ).pack(side="left", padx=(0, 10))
-
-        self.dedupe_var = tk.BooleanVar(value=False)
-        ctk.CTkCheckBox(
-            mid,
-            text="Remove duplicates",
-            variable=self.dedupe_var,
-            command=self._on_dedupe_toggle,
-            font=font(11),
-            text_color=p.tx2,
-            fg_color=p.acc,
-            hover_color=p.acc_hover,
-            border_color=p.ctlb,
-            checkmark_color=p.accent_ink,
-            corner_radius=RADIUS_CONTROL,
-            width=20,
-            height=20,
-        ).pack(side="left")
-
-        # Right: timer
-        right = ctk.CTkFrame(bar, fg_color="transparent")
-        right.grid(row=0, column=2, sticky="e", padx=PAD)
-        ctk.CTkLabel(
-            right,
-            text="ELAPSED",
-            font=font(10, bold=True),
-            text_color=p.tx3,
-        ).pack(side="left", padx=(0, 8))
-        self.timer_var = tk.StringVar(value="0:00")
-        ctk.CTkLabel(
-            right,
-            textvariable=self.timer_var,
-            font=font(13, bold=True),
-            text_color=p.tx,
-            width=64,
-            anchor="e",
-        ).pack(side="left")
-
-        # Hairline under toolbar
         ctk.CTkFrame(self, fg_color=p.hl, height=1, corner_radius=0).grid(
             row=0, column=0, sticky="sew"
         )
 
     def _build_body(self) -> None:
         p = self.pal
-        body = ctk.CTkFrame(self, fg_color=p.bg, corner_radius=0)
-        body.grid(row=1, column=0, sticky="nsew")
-        body.grid_columnconfigure(1, weight=1)
-        body.grid_rowconfigure(0, weight=1)
+        self.body = ctk.CTkFrame(self, fg_color=p.bg, corner_radius=0)
+        self.body.grid(row=1, column=0, sticky="nsew")
+        self.body.grid_columnconfigure(1, weight=1)
+        self.body.grid_rowconfigure(0, weight=1)
+        self._build_sidebar(self.body)
+        self._build_main(self.body)
+        self._build_counts(self.body)
 
-        self._build_sidebar(body)
-        self._build_main(body)
-        self._build_counts(body)
+    def _section_header(self, parent, title: str, on_add) -> ctk.CTkFrame:
+        p = self.pal
+        head = ctk.CTkFrame(parent, fg_color="transparent", height=SIDEBAR_SECTION_H + 6)
+        head.grid_propagate(False)
+        head.grid_columnconfigure(0, weight=1)
+        head.grid_rowconfigure(0, weight=1)
+        ctk.CTkLabel(
+            head,
+            text=section_label_text(title),
+            font=font(10, bold=True),
+            text_color=p.tx3,
+            anchor="w",
+        ).grid(row=0, column=0, sticky="w")
+        btn = IconButton(
+            head,
+            icon="plus",
+            command=on_add,
+            color=p.acc,
+            hover=p.acc_hover,
+            bg=p.side,
+            size=22,
+            glyph=14,
+        )
+        btn.grid(row=0, column=1, sticky="e")
+        return head
 
     def _build_sidebar(self, parent: ctk.CTkFrame) -> None:
         p = self.pal
-        side = ctk.CTkFrame(
-            parent,
-            fg_color=p.side,
-            width=SIDEBAR_W,
-            corner_radius=0,
-            border_width=0,
-        )
+        side = ctk.CTkFrame(parent, fg_color=p.side, width=SIDEBAR_W, corner_radius=0)
         side.grid(row=0, column=0, sticky="nsw")
         side.grid_propagate(False)
         side.grid_columnconfigure(0, weight=1)
-        side.grid_rowconfigure(2, weight=1)
+        side.grid_rowconfigure(9, weight=1)
 
-        # SOURCES section
+        ctk.CTkFrame(side, fg_color=p.ctlb, width=1, corner_radius=0).place(
+            relx=1.0, x=-1, y=0, relheight=1
+        )
+
+        pad = PAD
+
+        src_head = self._section_header(side, "Sources", self._add_source)
+        src_head.grid(
+            row=0, column=0, sticky="ew", padx=pad, pady=(BODY_PAD_T, HEADER_TO_ROWS)
+        )
+
+        self.sources_list = ctk.CTkFrame(side, fg_color="transparent")
+        self.sources_list.grid(
+            row=1, column=0, sticky="ew", padx=pad - ROW_PAD_X, pady=(0, SECTION_GAP)
+        )
+        self.sources_list.grid_columnconfigure(0, weight=1)
+
+        dest_head = self._section_header(side, "Destination", self._add_destination)
+        dest_head.grid(row=2, column=0, sticky="ew", padx=pad, pady=(0, HEADER_TO_ROWS))
+
+        self.dest_list = ctk.CTkFrame(side, fg_color="transparent")
+        self.dest_list.grid(
+            row=3, column=0, sticky="ew", padx=pad - ROW_PAD_X, pady=(0, SECTION_GAP)
+        )
+        self.dest_list.grid_columnconfigure(0, weight=1)
+
+        task_head = ctk.CTkFrame(side, fg_color="transparent", height=SIDEBAR_SECTION_H)
+        task_head.grid(row=4, column=0, sticky="ew", padx=pad, pady=(0, HEADER_TO_ROWS))
+        task_head.grid_propagate(False)
         ctk.CTkLabel(
-            side,
-            text="SOURCES",
+            task_head,
+            text=section_label_text("Task"),
             font=font(10, bold=True),
             text_color=p.tx3,
             anchor="w",
-        ).grid(row=0, column=0, sticky="ew", padx=PAD, pady=(PAD, 6))
+        ).pack(side="left")
 
-        list_wrap = ctk.CTkFrame(
+        self.job_var = tk.StringVar(value="Scan")
+        self.job_menu = ctk.CTkOptionMenu(
             side,
-            fg_color=p.panel,
-            corner_radius=RADIUS_CORNER,
-            border_width=1,
-            border_color=p.hl,
-        )
-        list_wrap.grid(row=1, column=0, sticky="ew", padx=PAD, pady=(0, 8))
-        list_wrap.grid_columnconfigure(0, weight=1)
-
-        self.source_list = tk.Listbox(
-            list_wrap,
-            height=8,
-            activestyle="none",
-            selectmode=tk.EXTENDED,
-            exportselection=False,
-            font=("SF Pro Text", 11),
-            bg=p.panel,
-            fg=p.tx,
-            selectbackground=p.acc,
-            selectforeground=p.accent_ink,
-            highlightthickness=0,
-            borderwidth=0,
-            relief="flat",
-        )
-        self.source_list.grid(row=0, column=0, sticky="nsew", padx=4, pady=4)
-
-        src_btns = ctk.CTkFrame(side, fg_color="transparent")
-        src_btns.grid(row=2, column=0, sticky="new", padx=PAD)
-        src_btns.grid_columnconfigure((0, 1), weight=1)
-
-        self._ghost_btn(src_btns, "Add", self._add_source).grid(
-            row=0, column=0, sticky="ew", padx=(0, 4), pady=(0, 4)
-        )
-        self._ghost_btn(src_btns, "Remove", self._remove_sources).grid(
-            row=0, column=1, sticky="ew", padx=(4, 0), pady=(0, 4)
-        )
-        self._ghost_btn(src_btns, "Clear", self._clear_sources).grid(
-            row=1, column=0, sticky="ew", padx=(0, 4), pady=(0, 4)
-        )
-        self.scan_computer_btn = self._secondary_btn(
-            src_btns, "Scan Computer", self._on_scan_computer
-        )
-        self.scan_computer_btn.grid(row=1, column=1, sticky="ew", padx=(4, 0), pady=(0, 4))
-        self.collect_btn = self._secondary_btn(
-            src_btns, "Collect MIDI…", self._on_collect_midi
-        )
-        self.collect_btn.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(0, 4))
-        self.resume_btn = self._secondary_btn(src_btns, "Resume Scan", self._on_resume_scan)
-        self.resume_btn.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(0, 8))
-        self.resume_btn.configure(state="disabled")
-
-        # DESTINATION
-        ctk.CTkFrame(side, fg_color=p.hl, height=1, corner_radius=0).grid(
-            row=3, column=0, sticky="ew", padx=PAD, pady=(4, 8)
-        )
-        ctk.CTkLabel(
-            side,
-            text="DESTINATION",
-            font=font(10, bold=True),
-            text_color=p.tx3,
-            anchor="w",
-        ).grid(row=4, column=0, sticky="ew", padx=PAD, pady=(0, 6))
-
-        dest_row = ctk.CTkFrame(side, fg_color="transparent")
-        dest_row.grid(row=5, column=0, sticky="ew", padx=PAD, pady=(0, PAD))
-        dest_row.grid_columnconfigure(0, weight=1)
-        self.dest_var = tk.StringVar()
-        self.dest_entry = ctk.CTkEntry(
-            dest_row,
-            textvariable=self.dest_var,
-            height=BTN_H,
-            font=font(11),
-            fg_color=p.field,
-            border_color=p.ctlb,
+            values=list(JOB_MODES),
+            variable=self.job_var,
+            height=30,
+            font=font(12),
+            dropdown_font=font(12),
+            fg_color=p.ctl,
+            button_color=p.ctl,
+            button_hover_color=p.hover,
             text_color=p.tx,
-            corner_radius=RADIUS_CORNER,
-            placeholder_text="Choose folder…",
+            dropdown_fg_color=p.ctl,
+            dropdown_hover_color=p.hover,
+            dropdown_text_color=p.tx,
+            corner_radius=RADIUS_CHIP,
+            anchor="w",
         )
-        self.dest_entry.grid(row=0, column=0, sticky="ew", padx=(0, 6))
-        self._ghost_btn(dest_row, "Browse", self._browse_dest, width=72).grid(row=0, column=1)
+        self.job_menu.grid(row=5, column=0, sticky="ew", padx=pad, pady=(0, SECTION_GAP))
+
+        self.dedupe_var = tk.BooleanVar(value=False)
+        self.dedupe_switch = MiniSwitch(
+            side,
+            caption="Remove duplicates",
+            variable=self.dedupe_var,
+            command=self._on_dedupe_toggle,
+            bg=p.side,
+            tx=p.tx,
+            tx2=p.tx2,
+            tx3=p.tx3,
+            acc=p.acc,
+            accent_ink=p.accent_ink,
+            ctl=p.ctlb,
+        )
+        self.dedupe_switch.grid(
+            row=6, column=0, sticky="ew", padx=pad, pady=(0, SECTION_GAP)
+        )
+
+        actions = ctk.CTkFrame(side, fg_color="transparent")
+        actions.grid(row=7, column=0, sticky="ew", padx=pad, pady=(0, 6))
+        actions.grid_columnconfigure((0, 1), weight=1)
+
+        self.start_btn = ctk.CTkButton(
+            actions,
+            text="Start",
+            command=self._on_start,
+            height=30,
+            font=font(12, bold=True),
+            fg_color=p.ctl,
+            hover_color=p.hover,
+            text_color=p.tx,
+            border_width=1,
+            border_color=p.ctlb,
+            corner_radius=7,
+        )
+        self.start_btn.grid(row=0, column=0, sticky="ew", padx=(0, 3))
+
+        self.stop_btn = ctk.CTkButton(
+            actions,
+            text="Stop",
+            command=self._on_halt,
+            height=30,
+            font=font(12, bold=True),
+            fg_color=p.ctl,
+            hover_color=p.hover,
+            text_color=p.tx2,
+            border_width=1,
+            border_color=p.ctlb,
+            corner_radius=7,
+            state="disabled",
+        )
+        self.stop_btn.grid(row=0, column=1, sticky="ew", padx=(3, 0))
+
+        self.resume_btn = ctk.CTkButton(
+            side,
+            text="Resume",
+            command=self._on_resume,
+            height=30,
+            font=font(12, bold=True),
+            fg_color=p.acc,
+            hover_color=p.acc_hover,
+            text_color=p.accent_ink,
+            corner_radius=7,
+        )
+        self.resume_btn.grid(row=8, column=0, sticky="ew", padx=pad, pady=(0, PAD_V))
+        self.resume_btn.grid_remove()
 
     def _build_main(self, parent: ctk.CTkFrame) -> None:
         p = self.pal
-        main = ctk.CTkFrame(
-            parent,
-            fg_color=p.panel,
-            corner_radius=0,
-            border_width=0,
-        )
+        main = ctk.CTkFrame(parent, fg_color=p.panel, corner_radius=0)
         main.grid(row=0, column=1, sticky="nsew")
         main.grid_columnconfigure(0, weight=1)
         main.grid_rowconfigure(1, weight=1)
 
-        header = ctk.CTkFrame(main, fg_color=p.panel, height=36, corner_radius=0)
-        header.grid(row=0, column=0, sticky="ew", padx=PAD, pady=(10, 0))
+        header = ctk.CTkFrame(main, fg_color=p.rollchrome, height=LIST_HEADER_H, corner_radius=0)
+        header.grid(row=0, column=0, sticky="ew")
         header.grid_propagate(False)
-        header.grid_columnconfigure(0, weight=1)
+        header.grid_columnconfigure(1, weight=1)
+        header.grid_rowconfigure(0, weight=1)
+        ctk.CTkFrame(header, fg_color=p.hl, height=1, corner_radius=0).place(
+            relx=0, rely=1.0, relwidth=1, y=-1
+        )
 
         ctk.CTkLabel(
             header,
@@ -335,125 +330,103 @@ class MidiOrganizerApp(ctk.CTk):
             font=font(10, bold=True),
             text_color=p.tx3,
             anchor="w",
-        ).grid(row=0, column=0, sticky="w")
+        ).grid(row=0, column=0, sticky="w", padx=PAD)
         self.summary_var = tk.StringVar(value="0 files · 0 B")
         ctk.CTkLabel(
             header,
             textvariable=self.summary_var,
-            font=font(12, bold=True),
-            text_color=p.tx,
+            font=font(11, bold=True),
+            text_color=p.tx2,
             anchor="e",
-        ).grid(row=0, column=1, sticky="e")
+        ).grid(row=0, column=2, sticky="e", padx=PAD)
 
-        table_frame = ctk.CTkFrame(
-            main,
-            fg_color=p.panel,
-            corner_radius=RADIUS_CORNER,
-            border_width=1,
-            border_color=p.hl,
-        )
-        table_frame.grid(row=1, column=0, sticky="nsew", padx=PAD, pady=(6, PAD))
+        table_frame = ctk.CTkFrame(main, fg_color=p.panel, corner_radius=0)
+        table_frame.grid(row=1, column=0, sticky="nsew")
         table_frame.grid_columnconfigure(0, weight=1)
         table_frame.grid_rowconfigure(0, weight=1)
 
-        cols = ("filename", "category", "reason", "size", "relative")
+        cols = ("filename", "category", "size", "relative")
         self.tree = ttk.Treeview(
             table_frame,
             columns=cols,
             show="headings",
             selectmode="browse",
         )
-        self.tree.heading("filename", text="Filename")
+        self.tree.heading("filename", text="Name")
         self.tree.heading("category", text="Kind")
-        self.tree.heading("reason", text="Reason")
         self.tree.heading("size", text="Size")
         self.tree.heading("relative", text="Path")
-        self.tree.column("filename", width=200, stretch=True)
-        self.tree.column("category", width=80, stretch=False, anchor="center")
-        self.tree.column("reason", width=120, stretch=False)
+        self.tree.column("filename", width=240, stretch=True)
+        self.tree.column("category", width=88, stretch=False, anchor="w")
         self.tree.column("size", width=72, stretch=False, anchor="e")
-        self.tree.column("relative", width=280, stretch=True)
+        self.tree.column("relative", width=300, stretch=True)
 
         scroll = ttk.Scrollbar(table_frame, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=scroll.set)
-        self.tree.grid(row=0, column=0, sticky="nsew", padx=1, pady=1)
-        scroll.grid(row=0, column=1, sticky="ns", pady=1)
+        self.tree.grid(row=0, column=0, sticky="nsew")
+        scroll.grid(row=0, column=1, sticky="ns")
 
     def _build_counts(self, parent: ctk.CTkFrame) -> None:
         p = self.pal
-        panel = ctk.CTkFrame(
-            parent,
-            fg_color=p.rollchrome,
-            width=COUNTS_W,
-            corner_radius=0,
-            border_width=0,
+        self.counts_panel = ctk.CTkFrame(
+            parent, fg_color=p.rollchrome, width=COUNTS_W, corner_radius=0
         )
-        panel.grid(row=0, column=2, sticky="nsw")
-        panel.grid_propagate(False)
+        self.counts_panel.grid(row=0, column=2, sticky="nsw")
+        self.counts_panel.grid_propagate(False)
+        ctk.CTkFrame(self.counts_panel, fg_color=p.hl, width=1, corner_radius=0).place(
+            x=0, y=0, relheight=1
+        )
 
-        # Hairline on left edge
-        ctk.CTkFrame(panel, fg_color=p.hl, width=1, corner_radius=0).place(x=0, y=0, relheight=1)
-
-        inner = ctk.CTkFrame(panel, fg_color="transparent")
-        inner.pack(fill="both", expand=True, padx=PAD, pady=PAD)
+        inner = ctk.CTkFrame(self.counts_panel, fg_color="transparent")
+        inner.pack(fill="both", expand=True, padx=PAD, pady=BODY_PAD_T)
 
         ctk.CTkLabel(
             inner,
-            text="COUNTS",
+            text=section_label_text("Counts"),
             font=font(10, bold=True),
             text_color=p.tx3,
             anchor="w",
-        ).pack(fill="x", pady=(0, 10))
+        ).pack(fill="x", pady=(0, HEADER_TO_ROWS + 4))
 
         self.count_labels: dict[str, ctk.CTkLabel] = {}
-        self.kind_dots: dict[str, ctk.CTkFrame] = {}
         for cat in CATEGORIES:
-            row = ctk.CTkFrame(inner, fg_color="transparent", height=LIST_ROW_H)
-            row.pack(fill="x", pady=2)
+            row = ctk.CTkFrame(inner, fg_color="transparent", height=SIDEBAR_ROW_H)
+            row.pack(fill="x", pady=1)
             row.pack_propagate(False)
-            dot = ctk.CTkFrame(
+            chip = ctk.CTkFrame(
                 row,
-                width=8,
-                height=8,
+                width=7,
+                height=7,
                 corner_radius=2,
                 fg_color=KIND_COLORS.get(cat, p.tx3),
             )
-            dot.pack(side="left", padx=(0, 8), pady=9)
-            ctk.CTkLabel(
-                row,
-                text=cat,
-                font=font(12),
-                text_color=p.tx,
-                anchor="w",
-            ).pack(side="left")
-            lbl = ctk.CTkLabel(
-                row,
-                text="0",
-                font=font(12, bold=True),
-                text_color=p.tx2,
-                anchor="e",
+            chip.pack(side="left", padx=(ROW_PAD_X, 8), pady=11)
+            ctk.CTkLabel(row, text=cat, font=font(12), text_color=p.tx, anchor="w").pack(
+                side="left"
             )
-            lbl.pack(side="right")
+            lbl = ctk.CTkLabel(
+                row, text="0", font=font(12, bold=True), text_color=p.tx2, anchor="e"
+            )
+            lbl.pack(side="right", padx=(0, ROW_PAD_X))
             self.count_labels[cat] = lbl
 
         ctk.CTkFrame(inner, fg_color=p.hl, height=1, corner_radius=0).pack(
-            fill="x", pady=(12, 10)
+            fill="x", pady=(SECTION_GAP, 10)
         )
-
         for label, attr, bold in (
             ("Total", "total_label", True),
             ("Size", "size_label", False),
             ("Duplicates", "dup_label", False),
         ):
-            row = ctk.CTkFrame(inner, fg_color="transparent")
-            row.pack(fill="x", pady=2)
+            row = ctk.CTkFrame(inner, fg_color="transparent", height=SIDEBAR_ROW_H - 4)
+            row.pack(fill="x", pady=1)
             ctk.CTkLabel(
                 row,
                 text=label,
                 font=font(12, bold=bold),
                 text_color=p.tx if bold else p.tx2,
                 anchor="w",
-            ).pack(side="left")
+            ).pack(side="left", padx=(ROW_PAD_X, 0))
             lbl = ctk.CTkLabel(
                 row,
                 text="0" if label != "Size" else "0 B",
@@ -461,120 +434,56 @@ class MidiOrganizerApp(ctk.CTk):
                 text_color=p.tx if bold else p.tx2,
                 anchor="e",
             )
-            lbl.pack(side="right")
+            lbl.pack(side="right", padx=(0, ROW_PAD_X))
             setattr(self, attr, lbl)
 
     def _build_status(self) -> None:
         p = self.pal
-        bot = ctk.CTkFrame(self, fg_color=p.chrome, corner_radius=0, height=64)
+        bot = ctk.CTkFrame(self, fg_color=p.chrome, corner_radius=0, height=88)
         bot.grid(row=2, column=0, sticky="ew")
         bot.grid_propagate(False)
         bot.grid_columnconfigure(0, weight=1)
-
         ctk.CTkFrame(bot, fg_color=p.hl, height=1, corner_radius=0).grid(
             row=0, column=0, sticky="ew"
         )
-
         inner = ctk.CTkFrame(bot, fg_color="transparent")
-        inner.grid(row=1, column=0, sticky="ew", padx=PAD, pady=(8, 8))
-        inner.grid_columnconfigure(0, weight=1)
+        inner.grid(row=1, column=0, sticky="ew", padx=PAD, pady=(10, 16))
+        inner.grid_columnconfigure(1, weight=1)
+
+        self.timer_var = tk.StringVar(value="0:00")
+        ctk.CTkLabel(
+            inner,
+            textvariable=self.timer_var,
+            font=font(12, bold=True),
+            text_color=p.tx,
+            width=52,
+            anchor="w",
+        ).grid(row=0, column=0, sticky="w", padx=(0, 10))
 
         self.progress = ctk.CTkProgressBar(
-            inner,
-            height=6,
-            corner_radius=3,
-            progress_color=p.acc,
-            fg_color=p.hl,
+            inner, height=6, corner_radius=3, progress_color=p.acc, fg_color=p.hl
         )
-        self.progress.grid(row=0, column=0, sticky="ew")
+        self.progress.grid(row=0, column=1, sticky="ew", padx=(0, 10))
         self.progress.set(0)
 
-        self.status_var = tk.StringVar(
-            value="Add sources, Collect MIDI… (fast dump), or Scan to classify."
-        )
+        self.progress_pct = tk.StringVar(value="")
         ctk.CTkLabel(
             inner,
-            textvariable=self.status_var,
-            font=font(11),
-            text_color=p.tx2,
-            anchor="w",
-        ).grid(row=1, column=0, sticky="ew", pady=(6, 0))
+            textvariable=self.progress_pct,
+            font=font(10, bold=True),
+            text_color=p.tx3,
+            width=110,
+            anchor="e",
+        ).grid(row=0, column=2, sticky="e")
 
+        self.status_var = tk.StringVar(value="Add a source, choose a task, then Start.")
+        ctk.CTkLabel(
+            inner, textvariable=self.status_var, font=font(11), text_color=p.tx2, anchor="w"
+        ).grid(row=1, column=0, columnspan=3, sticky="ew", pady=(8, 0))
         self.detail_var = tk.StringVar(value="")
         ctk.CTkLabel(
-            inner,
-            textvariable=self.detail_var,
-            font=font(10),
-            text_color=p.tx3,
-            anchor="w",
-        ).grid(row=2, column=0, sticky="ew", pady=(1, 0))
-
-    # ── Styled controls ──────────────────────────────────────────────────────
-
-    def _primary_btn(self, parent, text, command, width=100):
-        p = self.pal
-        return ctk.CTkButton(
-            parent,
-            text=text,
-            command=command,
-            width=width,
-            height=BTN_H,
-            font=font(11, bold=True),
-            fg_color=p.acc,
-            hover_color=p.acc_hover,
-            text_color=p.accent_ink,
-            corner_radius=RADIUS_CHIP,
-        )
-
-    def _secondary_btn(self, parent, text, command, width=100):
-        p = self.pal
-        return ctk.CTkButton(
-            parent,
-            text=text,
-            command=command,
-            width=width,
-            height=BTN_H,
-            font=font(11, bold=True),
-            fg_color=p.ctl,
-            hover_color=p.hover,
-            text_color=p.tx,
-            border_width=1,
-            border_color=p.ctlb,
-            corner_radius=RADIUS_CHIP,
-        )
-
-    def _ghost_btn(self, parent, text, command, width=0):
-        p = self.pal
-        kwargs = {"width": width} if width else {}
-        return ctk.CTkButton(
-            parent,
-            text=text,
-            command=command,
-            height=BTN_H,
-            font=font(11, bold=True),
-            fg_color=p.ctl,
-            hover_color=p.hover,
-            text_color=p.tx2,
-            border_width=1,
-            border_color=p.ctlb,
-            corner_radius=RADIUS_CHIP,
-            **kwargs,
-        )
-
-    def _danger_btn(self, parent, text, command, width=80):
-        p = self.pal
-        return ctk.CTkButton(
-            parent,
-            text=text,
-            command=command,
-            width=width,
-            height=BTN_H,
-            font=font(11, bold=True),
-            fg_color=p.danger,
-            hover_color=p.danger_hover,
-            text_color="#ffffff",
-            corner_radius=RADIUS_CHIP,
-        )
+            inner, textvariable=self.detail_var, font=font(10), text_color=p.tx3, anchor="w"
+        ).grid(row=2, column=0, columnspan=3, sticky="ew", pady=(2, 0))
 
     def _style_tree(self) -> None:
         p = self.pal
@@ -609,59 +518,140 @@ class MidiOrganizerApp(ctk.CTk):
         style.map("Treeview.Heading", background=[("active", p.hover)])
         style.layout("Treeview", [("Treeview.treearea", {"sticky": "nswe"})])
 
-    # ── Source / dest helpers ────────────────────────────────────────────────
+    # ── Path lists ───────────────────────────────────────────────────────────
 
-    def _on_mode_change(self, value: str) -> None:
-        self.mode_var.set(value.lower())
+    def _path_row(self, parent, path: str, on_remove, row: int) -> None:
+        p = self.pal
+        fr = ctk.CTkFrame(parent, fg_color="transparent", height=PATH_ROW_H)
+        fr.grid(row=row, column=0, sticky="ew", pady=2)
+        fr.grid_propagate(False)
+        fr.grid_columnconfigure(1, weight=1)
+        fr.grid_rowconfigure(0, weight=1)
 
-    def _sync_source_list(self) -> None:
-        self.source_list.delete(0, tk.END)
-        for path in self._sources:
-            self.source_list.insert(tk.END, path)
+        icon = IconButton(
+            fr,
+            icon="folder",
+            command=None,
+            color=p.acc,
+            hover=p.acc,
+            bg=p.side,
+            size=ICON_COL + 4,
+            glyph=14,
+        )
+        icon.grid(row=0, column=0, sticky="", padx=(ROW_PAD_X, ROW_ICON_GAP))
+
+        name = Path(path).name or path
+        ctk.CTkLabel(
+            fr, text=name, font=font(12), text_color=p.tx2, anchor="w"
+        ).grid(row=0, column=1, sticky="ew")
+
+        xbtn = IconButton(
+            fr,
+            icon="x",
+            command=on_remove,
+            color=DANGER,
+            hover=p.danger_hover,
+            bg=p.side,
+            size=22,
+            glyph=12,
+        )
+        xbtn.grid(row=0, column=2, sticky="", padx=(0, ROW_PAD_X))
+
+    def _refresh_path_lists(self) -> None:
+        p = self.pal
+        for child in self.sources_list.winfo_children():
+            child.destroy()
+        if not self._sources:
+            ctk.CTkLabel(
+                self.sources_list,
+                text="No sources",
+                font=font(11),
+                text_color=p.tx3,
+                anchor="w",
+            ).grid(row=0, column=0, sticky="ew", padx=ROW_PAD_X, pady=6)
+        else:
+            for i, path in enumerate(self._sources):
+                self._path_row(
+                    self.sources_list, path, lambda idx=i: self._remove_source_at(idx), i
+                )
+
+        for child in self.dest_list.winfo_children():
+            child.destroy()
+        if not self._dest:
+            ctk.CTkLabel(
+                self.dest_list,
+                text="No destination",
+                font=font(11),
+                text_color=p.tx3,
+                anchor="w",
+            ).grid(row=0, column=0, sticky="ew", padx=ROW_PAD_X, pady=4)
+        else:
+            self._path_row(self.dest_list, self._dest, self._clear_destination, 0)
+
+    def _toggle_counts(self) -> None:
+        w = self.winfo_width()
+        h = self.winfo_height()
+        if w < 100:
+            w = 1120
+        if self._counts_open:
+            self.counts_panel.grid_remove()
+            self._counts_open = False
+            self.counts_toggle.set_icon("more", self.pal.tx2)
+            self.geometry(f"{max(700, w - COUNTS_W)}x{h}")
+            self.minsize(700, 580)
+        else:
+            self.counts_panel.grid(row=0, column=2, sticky="nsw")
+            self._counts_open = True
+            self.counts_toggle.set_icon("sidebar-right", self.pal.tx2)
+            self.geometry(f"{w + COUNTS_W}x{h}")
+            self.minsize(900, 580)
+
+    def _folder_label(self, path: str) -> str:
+        return Path(path).name or path
 
     def _add_source(self) -> None:
+        if self._busy:
+            return
         path = filedialog.askdirectory(title="Add source folder")
         if not path:
             return
         resolved = str(Path(path).expanduser().resolve())
         if resolved not in self._sources:
             self._sources.append(resolved)
-            self._sync_source_list()
             self._results = []
-            self.status_var.set(f"Added source ({len(self._sources)} total).")
+            self._refresh_path_lists()
+            self.status_var.set(f"Added {self._folder_label(resolved)}")
+            self.detail_var.set(resolved)
 
-    def _remove_sources(self) -> None:
-        selected = list(self.source_list.curselection())
-        if not selected:
+    def _remove_source_at(self, index: int) -> None:
+        if self._busy or index < 0 or index >= len(self._sources):
             return
-        for index in reversed(selected):
-            del self._sources[index]
-        self._sync_source_list()
+        removed = self._sources.pop(index)
         self._results = []
-        self.status_var.set(f"{len(self._sources)} source folder(s).")
+        self._refresh_path_lists()
+        self.status_var.set(f"Removed {self._folder_label(removed)}")
+        self.detail_var.set("")
 
-    def _clear_sources(self) -> None:
-        self._sources.clear()
-        self._sync_source_list()
-        self._results = []
-        self.status_var.set("Sources cleared.")
+    def _add_destination(self) -> None:
+        if self._busy:
+            return
+        path = filedialog.askdirectory(title="Choose destination folder")
+        if not path:
+            return
+        self._dest = str(Path(path).expanduser().resolve())
+        self._refresh_path_lists()
+        self.status_var.set(f"Destination: {self._folder_label(self._dest)}")
+        self.detail_var.set(self._dest)
 
-    def _browse_dest(self) -> None:
-        path = filedialog.askdirectory(title="Select destination folder")
-        if path:
-            self.dest_var.set(path)
+    def _clear_destination(self) -> None:
+        if self._busy:
+            return
+        self._dest = None
+        self._refresh_path_lists()
+        self.status_var.set("Destination cleared.")
+        self.detail_var.set("")
 
-    def _refresh_resume_button(self) -> None:
-        cp = load_checkpoint()
-        can = bool(cp and cp.is_resumable() and not self._busy)
-        self.resume_btn.configure(state="normal" if can else "disabled")
-        if can and cp is not None:
-            self.detail_var.set(
-                f"Checkpoint: {cp.phase}, {len(cp.found):,} MIDI found, "
-                f"{len(cp.classified):,} classified"
-            )
-
-    # ── Timer / busy ─────────────────────────────────────────────────────────
+    # ── Timer / busy / progress ──────────────────────────────────────────────
 
     def _start_timer(self) -> None:
         self._timer_start = time.monotonic()
@@ -673,8 +663,8 @@ class MidiOrganizerApp(ctk.CTk):
     def _tick_timer(self) -> None:
         if self._timer_start is None:
             return
-        elapsed = time.monotonic() - self._timer_start
-        self.timer_var.set(format_duration(elapsed))
+        self.timer_var.set(format_duration(time.monotonic() - self._timer_start))
+        self._update_eta_label()
         self._timer_job = self.after(250, self._tick_timer)
 
     def _stop_timer(self) -> None:
@@ -682,18 +672,36 @@ class MidiOrganizerApp(ctk.CTk):
             self.after_cancel(self._timer_job)
             self._timer_job = None
         if self._timer_start is not None:
-            elapsed = time.monotonic() - self._timer_start
-            self.timer_var.set(format_duration(elapsed))
+            self.timer_var.set(format_duration(time.monotonic() - self._timer_start))
         self._timer_start = None
+
+    def _eta_text(self) -> str:
+        if self._timer_start is None or self._progress_total <= 0:
+            return ""
+        ratio = min(1.0, self._progress_current / self._progress_total)
+        if ratio < 0.02:
+            return ""
+        elapsed = time.monotonic() - self._timer_start
+        if elapsed < 0.5:
+            return ""
+        remaining = elapsed * (1.0 - ratio) / ratio
+        return f"~{format_duration(remaining)} left"
+
+    def _update_eta_label(self) -> None:
+        if self._progress_total and self._progress_total > 0:
+            ratio = min(1.0, self._progress_current / self._progress_total)
+            pct = f"{int(ratio * 100)}%"
+            eta = self._eta_text()
+            self.progress_pct.set(f"{pct} · {eta}" if eta else pct)
+        elif self._busy:
+            self.progress_pct.set("…")
 
     def _set_busy(self, busy: bool) -> None:
         self._busy = busy
         state = "disabled" if busy else "normal"
-        self.scan_btn.configure(state=state)
-        self.org_btn.configure(state=state)
-        self.scan_computer_btn.configure(state=state)
-        self.collect_btn.configure(state=state)
-        self.halt_btn.configure(state="normal" if busy else "disabled")
+        self.start_btn.configure(state=state)
+        self.job_menu.configure(state=state)
+        self.stop_btn.configure(state="normal" if busy else "disabled")
         if busy:
             self.resume_btn.configure(state="disabled")
             self._start_timer()
@@ -705,31 +713,57 @@ class MidiOrganizerApp(ctk.CTk):
         if not self._busy:
             return
         self._cancel_event.set()
-        self.status_var.set("Halting…")
-        self.halt_btn.configure(state="disabled")
+        self.status_var.set("Stopping…")
+        self.stop_btn.configure(state="disabled")
+
+    def _on_close(self) -> None:
+        if self._busy:
+            self._cancel_event.set()
+            self._persist_job_checkpoint()
+            # Give the worker a moment to finish its cancel path
+            self.after(400, self.destroy)
+            return
+        self.destroy()
 
     def _update_progress(self, update: ProgressUpdate) -> None:
         def ui() -> None:
             if update.total and update.total > 0:
-                self.progress.set(min(1.0, update.current / update.total))
+                self._progress_current = update.current
+                self._progress_total = update.total
+                ratio = min(1.0, update.current / update.total)
+                self.progress.set(ratio)
+                self._update_eta_label()
             else:
-                self._discover_pulse = 0.05 + ((self._discover_pulse + 0.03) % 0.35)
+                self._progress_current = 0
+                self._progress_total = 0
+                self._discover_pulse = 0.08 + ((self._discover_pulse + 0.04) % 0.55)
                 self.progress.set(self._discover_pulse)
+                self.progress_pct.set("…")
             self.status_var.set(update.message)
             detail = update.detail
-            if len(detail) > 120:
-                detail = "…" + detail[-119:]
+            if len(detail) > 140:
+                detail = "…" + detail[-139:]
             self.detail_var.set(detail)
 
         self.after(0, ui)
 
+    def _begin_job(self, status: str, job: str) -> None:
+        self._cancel_event.clear()
+        self._active_job = job
+        self._progress_current = 0
+        self._progress_total = 0
+        self._set_busy(True)
+        self._discover_pulse = 0.08
+        self.status_var.set(status)
+        self.detail_var.set("")
+        self.progress.set(0)
+        self.progress_pct.set("0%")
+
     def _fill_table(self, results: list[FileResult]) -> None:
         exclude = self.dedupe_var.get()
         self.tree.delete(*self.tree.get_children())
+        p = self.pal
         for i, r in enumerate(results):
-            reason = r.reason
-            if r.is_duplicate and r.duplicate_of:
-                reason = f"duplicate → {r.duplicate_of}"
             tag = "alt" if i % 2 else "base"
             self.tree.insert(
                 "",
@@ -737,21 +771,20 @@ class MidiOrganizerApp(ctk.CTk):
                 values=(
                     r.filename,
                     r.category,
-                    reason,
                     format_size(r.size_bytes),
                     r.relative,
                 ),
                 tags=(tag, r.category),
             )
-        p = self.pal
         self.tree.tag_configure("base", background=p.panel)
         self.tree.tag_configure("alt", background=p.rowalt)
+        for cat, color in KIND_COLORS.items():
+            self.tree.tag_configure(cat, foreground=color)
 
         counts = count_by_category(results, exclude_duplicates=exclude)
         shown = [r for r in results if not (exclude and r.is_duplicate)]
-        n_files = len(shown)
         size = total_size_bytes(results, exclude_duplicates=exclude)
-        self.summary_var.set(f"{n_files:,} files · {format_size(size)}")
+        self.summary_var.set(f"{len(shown):,} files · {format_size(size)}")
         for cat, lbl in self.count_labels.items():
             lbl.configure(text=str(counts.get(cat, 0)))
         self.total_label.configure(text=str(sum(counts.values())))
@@ -776,42 +809,161 @@ class MidiOrganizerApp(ctk.CTk):
                     else:
                         result.reason = "content"
         self._fill_table(self._results)
-        dups = duplicate_count(self._results)
-        if self.dedupe_var.get() and dups:
-            kept = len(self._results) - dups
-            self.status_var.set(
-                f"{len(self._results)} file(s), {dups} duplicate(s) (will keep {kept})."
-            )
+
+    # ── Job checkpoint / resume ──────────────────────────────────────────────
+
+    def _transfer_mode_for(self, job: str) -> str:
+        return "move" if job == "Move" else "copy"
+
+    def _init_job_checkpoint(
+        self,
+        job: str,
+        results: list[FileResult],
+        *,
+        transferred: list[str] | None = None,
+    ) -> None:
+        assert self._dest is not None
+        self._transferred = list(transferred or [])
+        self._job_cp = new_job_checkpoint(
+            job=job,
+            transfer_mode=self._transfer_mode_for(job),
+            sources=list(self._sources),
+            dest=self._dest,
+            remove_duplicates=self.dedupe_var.get(),
+            results=results,
+            transferred=self._transferred,
+        )
+        save_job_checkpoint(self._job_cp)
+
+    def _on_file_transferred(self, result: FileResult) -> None:
+        key = str(result.source)
+        self._transferred.append(key)
+        if self._job_cp is None:
+            return
+        self._job_cp.transferred = list(self._transferred)
+        if result.dest is not None:
+            for d in self._job_cp.results:
+                if d.get("source") == key:
+                    d["dest"] = str(result.dest)
+                    break
+        if len(self._transferred) % self._transfer_save_every == 0:
+            try:
+                save_job_checkpoint(self._job_cp)
+            except OSError:
+                pass
+
+    def _persist_job_checkpoint(self) -> None:
+        if self._job_cp is None:
+            return
+        self._job_cp.transferred = list(self._transferred)
+        if self._results:
+            self._job_cp.results = [file_result_to_dict(r) for r in self._results]
+        try:
+            save_job_checkpoint(self._job_cp)
+        except OSError:
+            pass
+
+    def _clear_active_checkpoint(self) -> None:
+        self._job_cp = None
+        self._transferred = []
+        clear_job_checkpoint()
+        self._refresh_resume_button()
+
+    def _refresh_resume_button(self) -> None:
+        cp = load_job_checkpoint()
+        self._pending_resume = cp
+        if cp is not None and not self._busy:
+            done = len(cp.transferred)
+            total = len(cp.results)
+            self.resume_btn.configure(text=f"Resume {cp.job} ({done:,}/{total:,})")
+            self.resume_btn.grid()
+            self.resume_btn.configure(state="normal")
         else:
-            self.status_var.set(f"{len(self._results)} MIDI file(s).")
+            self.resume_btn.grid_remove()
 
-    def _begin_job(self, status: str, *, using_checkpoint: bool = False) -> None:
-        self._cancel_event.clear()
-        self._using_checkpoint = using_checkpoint
-        self._set_busy(True)
-        self._discover_pulse = 0.05
-        self.status_var.set(status)
-        self.detail_var.set("")
-        self.progress.set(0)
-
-    # ── Scan / organize (logic unchanged) ────────────────────────────────────
-
-    def _on_scan(self) -> None:
+    def _on_resume(self) -> None:
         if self._busy:
             return
+        cp = load_job_checkpoint()
+        if cp is None:
+            self._refresh_resume_button()
+            return
+        self._sources = list(cp.sources)
+        self._dest = cp.dest
+        self.dedupe_var.set(cp.remove_duplicates)
+        self.job_var.set(cp.job)
+        results = [file_result_from_dict(d) for d in cp.results]
+        self._results = results
+        self._fill_table(results)
+        self._refresh_path_lists()
+        if cp.job == "Move" and not self._confirm_move():
+            return
+        self._run_transfer_job(
+            cp.job,
+            prior=results,
+            skip_sources=list(cp.transferred),
+            resume_from=cp,
+        )
+
+    # ── Start / modes ────────────────────────────────────────────────────────
+
+    def _require_sources(self) -> bool:
         if not self._sources:
             self.status_var.set("Add at least one source folder.")
-            return
+            return False
         missing = [p for p in self._sources if not Path(p).is_dir()]
         if missing:
             self.status_var.set(f"Invalid source: {missing[0]}")
-            return
+            return False
+        return True
 
-        if len(self._sources) == 1 and Path(self._sources[0]).resolve() == Path("/"):
-            self._start_checkpoint_scan(resume=False)
-            return
+    def _require_dest(self) -> bool:
+        if not self._dest:
+            self.status_var.set("Add a destination folder.")
+            return False
+        dest_path = Path(self._dest)
+        if not dest_path.exists():
+            try:
+                dest_path.mkdir(parents=True, exist_ok=True)
+            except OSError as exc:
+                self.status_var.set(f"Cannot create destination: {exc}")
+                return False
+        if not dest_path.is_dir():
+            self.status_var.set("Destination must be a folder.")
+            return False
+        return True
 
-        self._begin_job("Scanning…")
+    def _confirm_move(self) -> bool:
+        return bool(
+            messagebox.askyesno(
+                "Confirm Move",
+                "Move all MIDI files out of the source folders into the "
+                "destination?\n\n"
+                "This relocates the originals — they will no longer be in "
+                "the source folders. Prefer Copy if you want to keep them.",
+                icon="warning",
+                default="no",
+            )
+        )
+
+    def _on_start(self) -> None:
+        if self._busy:
+            return
+        mode = self.job_var.get()
+        if mode == "Scan":
+            self._run_scan()
+        elif mode in TRANSFER_JOBS:
+            if mode == "Move" and not self._confirm_move():
+                return
+            clear_job_checkpoint()
+            self._run_transfer_job(mode)
+        else:
+            self._run_scan()
+
+    def _run_scan(self) -> None:
+        if not self._require_sources():
+            return
+        self._begin_job("Scanning…", "Scan")
         sources = list(self._sources)
         remove_duplicates = self.dedupe_var.get()
 
@@ -824,340 +976,182 @@ class MidiOrganizerApp(ctk.CTk):
                     should_cancel=self._cancel_event.is_set,
                 )
             except ScanCancelled:
-                self.after(0, lambda: self._scan_done([], cancelled=True))
+                self.after(0, lambda: self._job_done(cancelled=True))
                 return
             except Exception as exc:  # noqa: BLE001
                 err = str(exc)
-                self.after(0, lambda e=err: self._scan_done([], error=e))
+                self.after(0, lambda e=err: self._job_done(error=e))
                 return
-            self.after(0, lambda r=results: self._scan_done(r))
+            self.after(0, lambda r=results: self._scan_finished(r))
 
         threading.Thread(target=work, daemon=True).start()
 
-    def _on_scan_computer(self) -> None:
-        if self._busy:
-            return
-        existing = load_checkpoint()
-        if existing and existing.is_resumable():
-            resume = messagebox.askyesnocancel(
-                "Checkpoint found",
-                "A previous whole-computer scan can be resumed.\n\n"
-                "Yes = Resume\nNo = Start fresh (overwrite checkpoint)\nCancel = Abort",
-            )
-            if resume is None:
-                return
-            if resume:
-                self._start_checkpoint_scan(resume=True)
-                return
-        else:
-            ok = messagebox.askokcancel(
-                "Scan Computer",
-                "Scan the entire computer from / and classify every MIDI file.\n\n"
-                "This parses each file and can take many hours.\n"
-                "For a fast dump into one folder, use Collect MIDI… instead.\n\n"
-                "Progress is saved so you can Halt and Resume.",
-            )
-            if not ok:
-                return
-        self._start_checkpoint_scan(resume=False)
-
-    def _on_collect_midi(self) -> None:
-        if self._busy:
-            return
-        ok = messagebox.askokcancel(
-            "Collect MIDI",
-            "Copy every .mid / .midi file from this Mac into one folder.\n\n"
-            "Extension match + copy only (no hashing, no classify).\n"
-            "Skips /Volumes (network drives) so NAS mounts don’t stall the run.\n"
-            "If the disk fills up, pauses until space is free (Halt to stop).\n"
-            "Afterward, Add that folder as a source and Scan to sort.",
-        )
-        if not ok:
-            return
-        dest = filedialog.askdirectory(title="Choose folder to collect MIDI into")
-        if not dest:
-            return
-        dest_resolved = str(Path(dest).expanduser().resolve())
-        self._begin_job(f"Collecting MIDI into {dest_resolved}…")
-
-        def work() -> None:
-            try:
-                stats = collect_midi(
-                    "/",
-                    dest_resolved,
-                    progress=self._update_progress,
-                    should_cancel=self._cancel_event.is_set,
-                )
-            except ScanCancelled:
-                self.after(
-                    0,
-                    lambda: self._collect_done(None, cancelled=True, dest=dest_resolved),
-                )
-                return
-            except Exception as exc:  # noqa: BLE001
-                err = str(exc)
-                self.after(
-                    0,
-                    lambda e=err: self._collect_done(None, error=e, dest=dest_resolved),
-                )
-                return
-            self.after(
-                0,
-                lambda s=stats: self._collect_done(s, dest=dest_resolved),
-            )
-
-        threading.Thread(target=work, daemon=True).start()
-
-    def _collect_done(
+    def _run_transfer_job(
         self,
-        stats: CollectStats | None,
+        job: str,
         *,
-        dest: str,
-        error: str | None = None,
-        cancelled: bool = False,
+        prior: list[FileResult] | None = None,
+        skip_sources: list[str] | None = None,
+        resume_from: JobCheckpoint | None = None,
     ) -> None:
-        self._set_busy(False)
-        self.progress.set(0)
-        elapsed = self.timer_var.get()
-        if error:
-            self.status_var.set(f"Collect failed: {error}")
-            self.detail_var.set("")
-            messagebox.showerror("Collect failed", error)
+        if not self._require_sources() or not self._require_dest():
             return
-        if cancelled:
-            self.status_var.set(f"Collect halted.  ({elapsed})")
-            self.detail_var.set(dest)
-            return
-        assert stats is not None
-        msg = (
-            f"Collected {stats.copied:,} MIDI "
-            f"(found {stats.found:,}, skipped {stats.skipped:,}, "
-            f"errors {stats.errors:,})  ({elapsed})"
-        )
-        self.status_var.set(msg)
-        self.detail_var.set(dest)
-        add = messagebox.askyesno(
-            "Collect complete",
-            f"{msg}\n\nDestination:\n{dest}\n\n"
-            "Add this folder as a source so you can Scan and Organize?",
-        )
-        if add and dest not in self._sources:
-            self._sources.append(dest)
-            self._sync_source_list()
-            self.status_var.set(f"{msg} — added as source.")
+        assert self._dest is not None
 
-    def _on_resume_scan(self) -> None:
-        if self._busy:
-            return
-        cp = load_checkpoint()
-        if not cp or not cp.is_resumable():
-            self.status_var.set("No resumable checkpoint found.")
-            self._refresh_resume_button()
-            return
-        self._start_checkpoint_scan(resume=True)
-
-    def _start_checkpoint_scan(self, *, resume: bool) -> None:
-        if resume:
-            cp = load_checkpoint()
-            if not cp or not cp.is_resumable():
-                self.status_var.set("No resumable checkpoint found.")
-                return
+        transfer_mode = self._transfer_mode_for(job)
+        # Reuse completed scan for Copy/Move/Parse unless All (full pipeline)
+        if prior is not None:
+            results_arg: list[FileResult] | None = prior
+        elif job == "All":
+            results_arg = None
+        elif self._results:
+            results_arg = list(self._results)
         else:
-            clear_checkpoint()
-            cp = start_full_computer_checkpoint("/")
+            results_arg = None
 
-        if "/" not in self._sources:
-            self._sources = ["/"]
-            self._sync_source_list()
+        verb = "Moving" if transfer_mode == "move" else "Copying"
+        if results_arg is not None:
+            status = f"{verb} from scan…"
+        else:
+            status = f"Scanning then {verb.lower()}…"
+        if resume_from is not None:
+            status = f"Resuming {job}…"
 
-        self._begin_job(
-            "Resuming whole-computer scan…" if resume else "Scanning whole computer from /…",
-            using_checkpoint=True,
-        )
+        self._begin_job(status, job)
+        sources = list(self._sources)
+        dest = self._dest
         remove_duplicates = self.dedupe_var.get()
+        skip = list(skip_sources or [])
+
+        if results_arg is not None:
+            self._init_job_checkpoint(job, results_arg, transferred=skip)
+        else:
+            # Checkpoint after classify inside worker
+            self._job_cp = None
+            self._transferred = list(skip)
 
         def work() -> None:
             try:
-                results = classify_with_checkpoint(
-                    cp,
-                    progress=self._update_progress,
+                local_prior = results_arg
+                if local_prior is None:
+                    local_prior = classify_all(
+                        sources,
+                        progress=self._update_progress,
+                        remove_duplicates=False,
+                        should_cancel=self._cancel_event.is_set,
+                    )
+                    self._results = local_prior
+                    self._init_job_checkpoint(job, local_prior, transferred=skip)
+
+                def on_xfer(r: FileResult) -> None:
+                    if not self._results:
+                        self._results = local_prior or []
+                    self._on_file_transferred(r)
+
+                results, counts = organize(
+                    sources,
+                    dest,
+                    dry_run=False,
                     remove_duplicates=remove_duplicates,
+                    mode=transfer_mode,  # type: ignore[arg-type]
+                    results=local_prior,
+                    skip_sources=skip,
+                    on_transferred=on_xfer,
+                    progress=self._update_progress,
                     should_cancel=self._cancel_event.is_set,
                 )
             except ScanCancelled:
-                self.after(0, lambda: self._scan_done([], cancelled=True, checkpointed=True))
+                self._persist_job_checkpoint()
+                self.after(0, lambda: self._job_done(cancelled=True, resumable=True))
                 return
             except Exception as exc:  # noqa: BLE001
+                self._persist_job_checkpoint()
                 err = str(exc)
-                self.after(
-                    0,
-                    lambda e=err: self._scan_done([], error=e, checkpointed=True),
-                )
+                self.after(0, lambda e=err: self._job_done(error=e, resumable=True))
                 return
             self.after(
                 0,
-                lambda r=results: self._scan_done(r, checkpointed=True, finished=True),
+                lambda r=results, c=counts: self._transfer_finished(r, c, job=job),
             )
 
         threading.Thread(target=work, daemon=True).start()
 
-    def _scan_done(
+    def _job_done(
         self,
-        results: list[FileResult],
-        error: str | None = None,
         *,
+        error: str | None = None,
         cancelled: bool = False,
-        checkpointed: bool = False,
-        finished: bool = False,
+        resumable: bool = False,
     ) -> None:
         self._set_busy(False)
         self._cancel_event.clear()
+        self._active_job = None
         elapsed = self.timer_var.get()
         if cancelled:
-            msg = "Halted."
-            if checkpointed or self._using_checkpoint:
-                msg += " Progress saved — click Resume Scan to continue."
-            self.status_var.set(f"{msg}  ({elapsed})")
-            self.detail_var.set("")
+            self.status_var.set(f"Stopped.  ({elapsed})")
             self.progress.set(0)
-            self._refresh_resume_button()
+            self.progress_pct.set("")
+            if resumable:
+                self._refresh_resume_button()
             return
         if error:
-            self.status_var.set(f"Scan failed: {error}  ({elapsed})")
-            self.detail_var.set("")
+            self.status_var.set(f"Failed: {error}  ({elapsed})")
             self.progress.set(0)
-            self._refresh_resume_button()
-            return
+            self.progress_pct.set("")
+            if resumable:
+                self._refresh_resume_button()
+            messagebox.showerror("MIDI Organizer", error)
+
+    def _scan_finished(self, results: list[FileResult]) -> None:
+        self._set_busy(False)
+        self._cancel_event.clear()
+        self._active_job = None
+        elapsed = self.timer_var.get()
         self._results = results
         self._fill_table(results)
         self.progress.set(1)
+        self.progress_pct.set("100%")
         self.detail_var.set("")
-        if finished:
-            clear_checkpoint()
+        size = format_size(
+            total_size_bytes(results, exclude_duplicates=self.dedupe_var.get())
+        )
         dups = duplicate_count(results)
-        n_src = len(self._sources)
-        src_note = f" from {n_src} source(s)" if n_src > 1 else ""
-        size = format_size(total_size_bytes(results, exclude_duplicates=self.dedupe_var.get()))
         if self.dedupe_var.get() and dups:
             kept = len(results) - dups
             self.status_var.set(
-                f"Scan complete — {len(results):,} file(s){src_note}, "
+                f"Scan complete — {len(results):,} file(s), "
                 f"{dups} duplicate(s) (will keep {kept}), {size}  ({elapsed})"
             )
         else:
             self.status_var.set(
-                f"Scan complete — {len(results):,} MIDI file(s){src_note}, "
-                f"{size}  ({elapsed})"
-            )
-        self._refresh_resume_button()
-
-    def _on_organize(self) -> None:
-        if self._busy:
-            return
-        if not self._sources and not self._results:
-            self.status_var.set("Add at least one source folder (or finish a scan).")
-            return
-        if self._sources:
-            missing = [p for p in self._sources if not Path(p).is_dir()]
-            if missing:
-                self.status_var.set(f"Invalid source: {missing[0]}")
-                return
-        dest = self.dest_var.get().strip()
-        if not dest:
-            self.status_var.set("Choose a destination folder.")
-            return
-        dest_path = Path(dest)
-        if not dest_path.exists():
-            try:
-                dest_path.mkdir(parents=True, exist_ok=True)
-            except OSError as exc:
-                self.status_var.set(f"Cannot create destination: {exc}")
-                return
-        if not dest_path.is_dir():
-            self.status_var.set("Destination must be a folder.")
-            return
-
-        dry_run = self.dry_run_var.get()
-        remove_duplicates = self.dedupe_var.get()
-        mode = self.mode_var.get() if self.mode_var.get() in {"copy", "move"} else "copy"
-        action = "Dry run" if dry_run else ("Moving" if mode == "move" else "Copying")
-        self._begin_job(f"{action}…")
-        sources = list(self._sources) if self._sources else ["/"]
-        prior = list(self._results) if self._results else None
-
-        def work() -> None:
-            try:
-                results, counts = organize(
-                    sources,
-                    dest,
-                    dry_run=dry_run,
-                    remove_duplicates=remove_duplicates,
-                    mode=mode,  # type: ignore[arg-type]
-                    results=prior,
-                    progress=self._update_progress,
-                    should_cancel=self._cancel_event.is_set,
-                )
-            except ScanCancelled:
-                self.after(0, lambda: self._organize_done([], {}, cancelled=True))
-                return
-            except Exception as exc:  # noqa: BLE001
-                err = str(exc)
-                self.after(0, lambda e=err: self._organize_done([], {}, error=e))
-                return
-            self.after(
-                0,
-                lambda r=results, c=counts, d=dry_run, rd=remove_duplicates, m=mode: self._organize_done(
-                    r,
-                    c,
-                    dry_run=d,
-                    remove_duplicates=rd,
-                    mode=m,
-                ),
+                f"Scan complete — {len(results):,} MIDI file(s), {size}  ({elapsed})"
             )
 
-        threading.Thread(target=work, daemon=True).start()
-
-    def _organize_done(
+    def _transfer_finished(
         self,
         results: list[FileResult],
         counts: dict[str, int],
         *,
-        dry_run: bool = False,
-        remove_duplicates: bool = False,
-        mode: str = "copy",
-        error: str | None = None,
-        cancelled: bool = False,
+        job: str,
     ) -> None:
+        self._clear_active_checkpoint()
         self._set_busy(False)
         self._cancel_event.clear()
+        self._active_job = None
         elapsed = self.timer_var.get()
-        if cancelled:
-            self.status_var.set(f"Halted.  ({elapsed})")
-            self.detail_var.set("")
-            self.progress.set(0)
-            return
-        if error:
-            self.status_var.set(f"Organize failed: {error}  ({elapsed})")
-            self.detail_var.set("")
-            self.progress.set(0)
-            return
         self._results = results
         self._fill_table(results)
         self.progress.set(1)
+        self.progress_pct.set("100%")
         self.detail_var.set("")
         parts = [f"{c}: {counts.get(c, 0)}" for c in CATEGORIES]
-        if dry_run:
-            verb = "Dry run"
-        elif mode == "move":
-            verb = "Moved"
-        else:
-            verb = "Copied"
-        dups = duplicate_count(results) if remove_duplicates else 0
-        dup_note = f"  |  Skipped duplicates: {dups}" if dups else ""
-        size = format_size(total_size_bytes(results, exclude_duplicates=remove_duplicates))
+        size = format_size(
+            total_size_bytes(results, exclude_duplicates=self.dedupe_var.get())
+        )
+        verb = "Move" if job == "Move" else job
         self.status_var.set(
-            f"{verb} — {', '.join(parts)}  |  Total: {sum(counts.values())} "
-            f"({size}){dup_note}  ({elapsed})"
+            f"{verb} complete — {', '.join(parts)}  |  Total: {sum(counts.values())} "
+            f"({size})  ({elapsed})"
         )
 
 

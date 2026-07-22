@@ -94,17 +94,30 @@ DARK = Palette(
     accent_ink="#28282b",
 )
 
-# Metrics from MidiBrowser Theme / DesignSystem
+# Metrics from MidiBrowser DesignSystem / BrowserPanels (3c source-list)
 TOOLBAR_H = 52
-SIDEBAR_W = 220
+SIDEBAR_W = 212
 COUNTS_W = 188
-PAD = 12
-GRID = 8
+PAD = 14  # kPadH
+PAD_V = 12  # kPadV
+BODY_PAD_T = 10
+SECTION_GAP = 12
+HEADER_TO_ROWS = 4
+SIDEBAR_HEADER_H = 36
+SIDEBAR_SECTION_H = 18
+SIDEBAR_ROW_H = 29
+PATH_ROW_H = 36
+LIST_ROW_H = 26
+LIST_HEADER_H = 28
+ROW_PAD_X = 6
+ICON_COL = 18
+ROW_ICON_GAP = 6
 RADIUS_CORNER = 10
 RADIUS_CHIP = 6
 RADIUS_CONTROL = 5
 BTN_H = 28
-LIST_ROW_H = 26
+GRID = 8
+DANGER = "#D70015"
 
 FONT_UI = ("SF Pro Text", "Helvetica Neue", "Avenir Next", "Segoe UI")
 FONT_DISPLAY = ("SF Pro Display", "SF Pro Text", "Helvetica Neue", "Segoe UI")
@@ -128,8 +141,6 @@ def resolve_palette(appearance: str | None = None) -> Palette:
 
     mode = appearance or ctk.get_appearance_mode()
     if mode == "System":
-        # customtkinter reports Light/Dark after resolution via get_appearance_mode
-        # which may still say System — fall back to light Cupertino default
         try:
             import darkdetect
 

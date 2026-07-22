@@ -1,10 +1,10 @@
 # MIDI Organizer
 
-Desktop app that scans a folder tree for MIDI files, classifies them into **Drums**, **Bass**, **Lead**, **Chords**, **Arp**, and **Unknown**, then copies them into matching destination subfolders.
+Desktop app that scans folders for MIDI files, classifies them into **Drums**, **Bass**, **Lead**, **Chords**, **Arp**, and **Unknown**, then places them into matching destination subfolders.
 
 Classification uses filename hints first (e.g. `BA`, `ARP`, `Kick`), then MidiBrowser-style note analysis.
 
-The UI follows the same **Cupertino / Midi Toolkit** design system (colors, type, chrome layout) as [MidiBrowser](https://github.com/mganucheau/MidiBrowser).
+The UI follows a **macOS utility** layout with Cupertino / Midi Toolkit colors.
 
 ## Requirements
 
@@ -27,28 +27,18 @@ midi-organize
 python -m midi_parser
 ```
 
-### Recommended: collect whole-disk MIDI, then sort
+## Workflow
 
-1. Click **Collect MIDI…** and choose a dump folder — copies every `.mid` / `.midi` by extension into that one folder (**no hashing or classification**; skips `/Volumes`)
-2. When prompted, add the dump folder as a source (or **Add** it yourself)
-3. Browse to an organize **destination** (category library)
-4. Click **Scan** to classify, then **Organize**
+1. Click **+** next to **Sources** and pick one or more folders (× removes a row)
+2. Click **+** next to **Destination** and pick one output folder
+3. Choose a mode tab:
+   - **Scan** — classify MIDI into the results table (no copy)
+   - **Move** — copy every `.mid` / `.midi` into the destination (flat folder)
+   - **Parse** — classify and move files into category subfolders
+   - **All** — scan + parse in one run
+4. Optionally enable **Remove duplicates**
+5. Click **Start** (use **Stop** to cancel)
 
-### Classify a known folder
+The bottom bar shows a **progress** indicator, status, and current path. Use the toolbar control next to **Elapsed** to fold the counts inspector.
 
-1. **Add** one or more **source** folders
-2. Browse to a **destination** folder (existing libraries are reused — only missing category folders are created)
-3. Click **Scan** to preview classifications and counts
-4. Choose **Copy** or **Move**, then **Organize**
-
-Options:
-
-- **Collect MIDI…** — copy all `.mid` / `.midi` into one folder by extension (no hashing/parsing). Skips `/Volumes` (NAS). Prefer this over Scan Computer when you only need to gather files first. If the destination runs out of space, collect **pauses** and **resumes automatically** when enough free space is available (use **Halt** to stop).
-- **Scan Computer** — whole-disk discovery from `/` **and classify every file** (opens each MIDI; can take many hours). Crash-safe checkpoints in `~/.midi_parser/`.
-- **Resume Scan** — continue a halted or crashed whole-computer *classify* scan
-- **Copy / Move** — leave sources in place, or relocate them into the destination
-- **Dry run** — preview without copying or moving
-- **Remove duplicates** — skip identical content (SHA-256), including files already in the destination from a prior session
-- **Halt** — cancel an in-progress collect, scan, or copy/move (checkpointed classify scans can resume)
-
-While working, a **timer** and live status (phase, path, counts) show that the job is still moving. The results header shows **file count** and **total size**.
+While working, the **timer** and live status show that the job is still moving. Results show **file count** and **total size**.

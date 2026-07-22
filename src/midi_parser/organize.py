@@ -392,6 +392,8 @@ def organize(
     remove_duplicates: bool = False,
     mode: TransferMode = "copy",
     results: list[FileResult] | None = None,
+    skip_sources: Iterable[str] | None = None,
+    on_transferred: Callable[[FileResult], None] | None = None,
     progress: ProgressCallback | None = None,
     should_cancel: CancelCallback | None = None,
 ) -> tuple[list[FileResult], dict[str, int]]:
@@ -404,9 +406,13 @@ def organize(
     When remove_duplicates is True, skips content already in the destination
     and later source duplicates with the same hash.
 
+    skip_sources: absolute source paths already transferred (resume).
+    on_transferred: called after each successful copy/move (for checkpoints).
+
     Raises ScanCancelled if should_cancel returns True.
     """
     dest_root = Path(dest).expanduser().resolve()
+    already = {str(Path(p).expanduser().resolve()) for p in (skip_sources or [])}
 
     if results is None:
         results = classify_all(
@@ -442,6 +448,20 @@ def organize(
     for i, result in enumerate(results, start=1):
         if should_cancel and should_cancel():
             raise ScanCancelled()
+
+        src_key = str(result.source.resolve()) if result.source.exists() else str(result.source)
+        if src_key in already or str(result.source) in already:
+            if progress:
+                progress(
+                    ProgressUpdate(
+                        phase="transfer",
+                        message=f"Resume skip {i:,} / {total:,}",
+                        current=i,
+                        total=total,
+                        detail=result.relative,
+                    )
+                )
+            continue
 
         if remove_duplicates and result.is_duplicate:
             result.dest = None
@@ -482,6 +502,9 @@ def organize(
         if not dry_run:
             _transfer(result.source, target, mode)
             transferred += 1
+            already.add(src_key)
+            if on_transferred is not None:
+                on_transferred(result)
         if progress:
             verb = "Moving" if mode == "move" else "Copying"
             if dry_run:
